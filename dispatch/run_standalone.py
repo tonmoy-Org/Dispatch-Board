@@ -123,18 +123,18 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <div class="max-w-[760px] mx-auto px-4 py-8 sm:py-10">
 
             <!-- Status Banner -->
-            <div id="statusBanner" class="status-operational text-white px-5 py-3.5 rounded-md font-medium text-sm sm:text-base flex items-center justify-between shadow-sm transition-all duration-300 relative overflow-hidden">
+            <div id="statusBanner" class="{{BANNER_CLASS}}">
                 <div class="flex items-center gap-3">
-                    <svg id="statusIconCheck" class="w-5 h-5 flex-shrink-0 fill-current" viewBox="0 0 20 20">
+                    <svg id="statusIconCheck" class="{{ICON_CLASS}}" viewBox="0 0 20 20">
                         <path fill-rule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clip-rule="evenodd"/>
                     </svg>
                     <div class="flex flex-wrap items-center gap-2">
-                        <span id="bannerText">All Systems Operational</span>
-                        <span id="bannerProgressPill" class="hidden bg-white/20 backdrop-blur-sm text-white text-[11px] px-2.5 py-0.5 rounded-full font-medium"></span>
+                        <span id="bannerText">{{BANNER_TITLE}}</span>
+                        <span id="bannerProgressPill" class="{{PILL_CLASS}}">{{PILL_TEXT}}</span>
                     </div>
                 </div>
-                <span id="bannerPstText" class="text-xs text-white/95 font-medium bg-black/10 px-2.5 py-1 rounded-full whitespace-nowrap">Synced PST</span>
-                <div id="bannerProgressBar" class="hidden absolute bottom-0 left-0 h-[3px] bg-white/50 transition-all duration-500" style="width: 0%;"></div>
+                <span id="bannerPstText" class="text-xs text-white/95 font-medium bg-black/10 px-2.5 py-1 rounded-full whitespace-nowrap">{{BANNER_PST}}</span>
+                <div id="bannerProgressBar" class="{{BAR_CLASS}}" style="{{BAR_STYLE}}"></div>
             </div>
 
             <!-- About This Site -->
@@ -203,20 +203,20 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-2 mb-3">
                     <div>
                         <h3 class="text-xs font-medium uppercase tracking-wider text-gray-500">Live Automation Run Info</h3>
-                        <p id="liveStatusMsg" class="text-sm font-medium text-gray-800 mt-0.5">Ready for next scheduled cycle</p>
+                        <p id="liveStatusMsg" class="text-sm font-medium text-gray-800 mt-0.5">{{INITIAL_STATUS_MSG}}</p>
                     </div>
                     <div class="flex items-center gap-2">
-                        <span id="liveModeBadge" class="px-2 py-0.5 rounded text-[11px] font-medium bg-blue-50 text-[#3182CE] border border-blue-200">LIVE MODE</span>
-                        <span id="livePercentBadge" class="px-2 py-0.5 rounded text-[11px] font-medium bg-green-50 text-green-700 border border-green-200">100%</span>
+                        <span id="liveModeBadge" class="px-2 py-0.5 rounded text-[11px] font-medium bg-blue-50 text-[#3182CE] border border-blue-200">{{INITIAL_MODE}}</span>
+                        <span id="livePercentBadge" class="px-2 py-0.5 rounded text-[11px] font-medium bg-green-50 text-green-700 border border-green-200">{{INITIAL_PERCENT}}</span>
                     </div>
                 </div>
                 <!-- Progress bar -->
                 <div class="w-full bg-gray-200 rounded-full h-2 overflow-hidden mb-2">
-                    <div id="liveProgressBar" class="bg-[#3182CE] h-2 rounded-full transition-all duration-500" style="width: 100%;"></div>
+                    <div id="liveProgressBar" class="bg-[#3182CE] h-2 rounded-full transition-all duration-500" style="{{INITIAL_PERCENT_STYLE}}"></div>
                 </div>
                 <div class="flex justify-between text-[11px] text-gray-500">
-                    <span id="liveDaysInfo">31 Days Configured</span>
-                    <span id="liveLastRunInfo">Last run: --</span>
+                    <span id="liveDaysInfo">{{INITIAL_DAYS_INFO}}</span>
+                    <span id="liveLastRunInfo">{{INITIAL_LAST_RUN}}</span>
                 </div>
             </section>
 
@@ -333,19 +333,34 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
         async function fetchStatus() {
             try {
-                const apiPath = window.location.pathname.startsWith('/dispatch') ? '/dispatch/api' : '/api';
-                const res = await fetch(apiPath);
+                const basePath = window.location.pathname.replace(/\/+$/, '');
+                const apiPath = (basePath ? basePath + '/api' : '/dispatch/api') + '?t=' + Date.now();
+                let res = await fetch(apiPath, { cache: 'no-store' });
+                if (!res.ok) {
+                    res = await fetch('/dispatch/api?t=' + Date.now(), { cache: 'no-store' });
+                }
+                if (!res.ok) {
+                    res = await fetch('/api?t=' + Date.now(), { cache: 'no-store' });
+                }
                 if (!res.ok) return;
                 const data = await res.json();
                 updateUI(data);
             } catch (err) {
                 console.warn('Status poll warning:', err);
+                try {
+                    const fallbackRes = await fetch('/dispatch/api?t=' + Date.now(), { cache: 'no-store' });
+                    if (fallbackRes.ok) {
+                        const fallbackData = await fallbackRes.json();
+                        updateUI(fallbackData);
+                    }
+                } catch (e) {}
             }
         }
 
         function updateUI(data) {
+            if (!data) return;
             const progress = data.progress || {};
-            const isRunning = (progress.status === 'running' || data.last_status === 'running');
+            const isRunning = (progress.status === 'running' || progress.status === 'processing' || data.last_status === 'running');
             const isError = (data.last_status && data.last_status.startsWith('error'));
 
             const banner = document.getElementById('statusBanner');
@@ -355,34 +370,36 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             const bannerBar = document.getElementById('bannerProgressBar');
             const bannerPstText = document.getElementById('bannerPstText');
 
-            if (data.last_run_pst) {
+            if (bannerPstText && data.last_run_pst) {
                 bannerPstText.textContent = `PST: ${data.last_run_pst}`;
             }
 
-            if (isRunning) {
-                banner.className = 'status-running text-white px-5 py-3.5 rounded-md font-medium text-sm sm:text-base flex items-center justify-between shadow-sm transition-all duration-300 relative overflow-hidden';
-                bannerText.textContent = 'Automation in Progress';
-                if (progressPill) {
-                    progressPill.textContent = `Day ${progress.current_day || 1} of ${progress.total_days || 31} (${Math.round(progress.percent_complete || 0)}%)`;
-                    progressPill.classList.remove('hidden');
+            if (banner && bannerText) {
+                if (isRunning) {
+                    banner.className = 'status-running text-white px-5 py-3.5 rounded-md font-medium text-sm sm:text-base flex items-center justify-between shadow-sm transition-all duration-300 relative overflow-hidden';
+                    bannerText.textContent = 'Automation in Progress';
+                    if (progressPill) {
+                        progressPill.textContent = `Day ${progress.current_day || 1} of ${progress.total_days || 31} (${Math.round(progress.percent_complete || 0)}%)`;
+                        progressPill.classList.remove('hidden');
+                    }
+                    if (iconCheck) iconCheck.classList.add('hidden');
+                    if (bannerBar) {
+                        bannerBar.classList.remove('hidden');
+                        bannerBar.style.width = `${progress.percent_complete || 0}%`;
+                    }
+                } else if (isError) {
+                    banner.className = 'status-error text-white px-5 py-3.5 rounded-md font-medium text-sm sm:text-base flex items-center justify-between shadow-sm transition-all duration-300 relative overflow-hidden';
+                    bannerText.textContent = 'Service Notice: Recent Sync Needs Attention';
+                    if (progressPill) progressPill.classList.add('hidden');
+                    if (iconCheck) iconCheck.classList.remove('hidden');
+                    if (bannerBar) bannerBar.classList.add('hidden');
+                } else {
+                    banner.className = 'status-operational text-white px-5 py-3.5 rounded-md font-medium text-sm sm:text-base flex items-center justify-between shadow-sm transition-all duration-300 relative overflow-hidden';
+                    bannerText.textContent = 'All Systems Operational';
+                    if (progressPill) progressPill.classList.add('hidden');
+                    if (iconCheck) iconCheck.classList.remove('hidden');
+                    if (bannerBar) bannerBar.classList.add('hidden');
                 }
-                iconCheck.classList.add('hidden');
-                if (bannerBar) {
-                    bannerBar.classList.remove('hidden');
-                    bannerBar.style.width = `${progress.percent_complete || 0}%`;
-                }
-            } else if (isError) {
-                banner.className = 'status-error text-white px-5 py-3.5 rounded-md font-medium text-sm sm:text-base flex items-center justify-between shadow-sm transition-all duration-300 relative overflow-hidden';
-                bannerText.textContent = 'Service Notice: Recent Sync Needs Attention';
-                if (progressPill) progressPill.classList.add('hidden');
-                iconCheck.classList.remove('hidden');
-                if (bannerBar) bannerBar.classList.add('hidden');
-            } else {
-                banner.className = 'status-operational text-white px-5 py-3.5 rounded-md font-medium text-sm sm:text-base flex items-center justify-between shadow-sm transition-all duration-300 relative overflow-hidden';
-                bannerText.textContent = 'All Systems Operational';
-                if (progressPill) progressPill.classList.add('hidden');
-                iconCheck.classList.remove('hidden');
-                if (bannerBar) bannerBar.classList.add('hidden');
             }
 
             // Update Live info card
@@ -419,8 +436,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             btn.disabled = true;
             btn.textContent = 'Triggering...';
             try {
-                const triggerPath = window.location.pathname.startsWith('/dispatch') ? '/dispatch/api/trigger' : '/api/trigger';
-                const res = await fetch(triggerPath, { method: 'POST' });
+                const basePath = window.location.pathname.replace(/\/+$/, '');
+                const triggerPath = (basePath ? basePath + '/api/trigger' : '/dispatch/api/trigger');
+                let res = await fetch(triggerPath, { method: 'POST' });
+                if (!res.ok) {
+                    res = await fetch('/dispatch/api/trigger', { method: 'POST' });
+                }
                 const json = await res.json();
                 alert(json.message || 'Run triggered successfully!');
                 closeModal();
@@ -433,15 +454,21 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             }
         }
 
-        // Initialize
-        document.addEventListener('DOMContentLoaded', () => {
+        // Initialize safely (handles both before and after DOMContentLoaded)
+        function initDashboard() {
             renderUptimeBars('barsSite');
             renderUptimeBars('barsAsset');
             renderUptimeBars('barsSession');
             renderIncidentHistory('initialized', '');
             fetchStatus();
-            setInterval(fetchStatus, 4000);
-        });
+            setInterval(fetchStatus, 3000);
+        }
+
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', initDashboard);
+        } else {
+            initDashboard();
+        }
     </script>
 </body>
 </html>
@@ -593,8 +620,55 @@ app.add_middleware(
 @app.get("/dispatch", response_class=HTMLResponse)
 @app.get("/dispatch/", response_class=HTMLResponse)
 async def get_dashboard():
-    """Serves the Atlassian Statuspage-inspired monitoring dashboard."""
-    return HTMLResponse(content=HTML_TEMPLATE, status_code=200)
+    """Serves the Atlassian Statuspage-inspired monitoring dashboard with pre-rendered live state."""
+    progress = STATUS_DATA.get("progress", {})
+    pct = round(progress.get("percent_complete", 0.0))
+    msg = progress.get("status_message") or "Waiting for scheduled cycle..."
+    mode = STATUS_DATA.get("mode", "LIVE")
+    current_date = progress.get("current_date") or "Today"
+    days_configured = STATUS_DATA.get("days_configured", 31)
+    last_run_pst = STATUS_DATA.get("last_run_pst") or "--"
+    is_running = (progress.get("status") in ("running", "processing") or STATUS_DATA.get("last_status") == "running")
+
+    if is_running:
+        banner_class = "status-running text-white px-5 py-3.5 rounded-md font-medium text-sm sm:text-base flex items-center justify-between shadow-sm transition-all duration-300 relative overflow-hidden"
+        banner_title = "Automation in Progress"
+        pill_class = "bg-white/20 backdrop-blur-sm text-white text-[11px] px-2.5 py-0.5 rounded-full font-medium"
+        pill_text = f"Day {progress.get('current_day', 1)} of {progress.get('total_days', 31)} ({pct}%)"
+        icon_class = "hidden"
+        bar_class = "absolute bottom-0 left-0 h-[3px] bg-white/50 transition-all duration-500"
+        bar_style = f"width: {pct}%;"
+    else:
+        banner_class = "status-operational text-white px-5 py-3.5 rounded-md font-medium text-sm sm:text-base flex items-center justify-between shadow-sm transition-all duration-300 relative overflow-hidden"
+        banner_title = "All Systems Operational"
+        pill_class = "hidden"
+        pill_text = ""
+        icon_class = "w-5 h-5 flex-shrink-0 fill-current"
+        bar_class = "hidden absolute bottom-0 left-0 h-[3px] bg-white/50 transition-all duration-500"
+        bar_style = "width: 0%;"
+
+    html = HTML_TEMPLATE
+    html = html.replace("{{BANNER_CLASS}}", banner_class)
+    html = html.replace("{{BANNER_TITLE}}", banner_title)
+    html = html.replace("{{PILL_CLASS}}", pill_class)
+    html = html.replace("{{PILL_TEXT}}", pill_text)
+    html = html.replace("{{ICON_CLASS}}", icon_class)
+    html = html.replace("{{BAR_CLASS}}", bar_class)
+    html = html.replace("{{BAR_STYLE}}", bar_style)
+    html = html.replace("{{BANNER_PST}}", f"PST: {last_run_pst}" if last_run_pst != "--" else "Synced PST")
+    html = html.replace("{{INITIAL_STATUS_MSG}}", msg)
+    html = html.replace("{{INITIAL_PERCENT}}", f"{pct}%")
+    html = html.replace("{{INITIAL_PERCENT_STYLE}}", f"width: {pct}%;")
+    html = html.replace("{{INITIAL_MODE}}", f"{mode} MODE")
+    html = html.replace("{{INITIAL_DAYS_INFO}}", f"{days_configured} Days Configured (Target: {current_date})")
+    html = html.replace("{{INITIAL_LAST_RUN}}", f"Last run: {last_run_pst}")
+
+    headers = {
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Pragma": "no-cache",
+        "Expires": "0"
+    }
+    return HTMLResponse(content=html, status_code=200, headers=headers)
 
 
 @app.get("/api")
@@ -603,7 +677,12 @@ async def get_dashboard():
 @app.get("/dispatch/api/status")
 async def get_status_json():
     """Returns the current real-time automation status in JSON format."""
-    return JSONResponse(content=STATUS_DATA)
+    headers = {
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Pragma": "no-cache",
+        "Expires": "0"
+    }
+    return JSONResponse(content=STATUS_DATA, headers=headers)
 
 
 @app.get("/health")
