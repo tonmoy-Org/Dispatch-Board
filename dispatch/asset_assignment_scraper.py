@@ -504,91 +504,59 @@ class AssetAssignmentScraper(BaseScraper):
             print(f"❌ Error applying filters: {e}")
             return False
 
-    async def _scroll_table_fully(self) -> None:
-        selectors = [
-            "tbody.fixed-body",
-            ".fixed-body-container",
-            ".kgViewport",
-            ".grid-viewport",
-            ".ui-grid-viewport",
-            ".list-table-scroll-container",
-            ".scroll-container",
-            ".p-datatable-wrapper",
-            ".p-datatable-scrollable-body",
-        ]
-        for sel in selectors:
-            try:
-                count = await self.page.evaluate(f"() => document.querySelectorAll('{sel}').length")
-                if count == 0:
-                    continue
-                
-                for idx in range(count):
-                    is_scrollable = await self.page.evaluate(
-                        f"() => {{"
-                        f"  const el = document.querySelectorAll('{sel}')[{idx}];"
-                        f"  return el && el.scrollHeight > el.clientHeight;"
-                        f"}}"
-                    )
-                    if not is_scrollable:
-                        continue
-                        
-                    print(f"DEBUG: Slowly scrolling '{sel}' (index {idx}) to load all data...")
-                    prev_scroll = -1
-                    stuck_count = 0
-                    for _ in range(1000):
-                        scroll_top = await self.page.evaluate(
-                            f"() => {{"
-                            f"  const el = document.querySelectorAll('{sel}')[{idx}];"
-                            f"  if (el) {{"
-                            f"    el.scrollTop += 400;"
-                            f"    el.dispatchEvent(new Event('scroll'));"
-                            f"    return el.scrollTop;"
-                            f"  }}"
-                            f"  return -1;"
-                            f"}}"
-                        )
-                        await self.page.wait_for_timeout(2000)
-                        if scroll_top == prev_scroll:
-                            stuck_count += 1
-                            if stuck_count >= 15:
-                                break
-                        else:
-                            stuck_count = 0
-                        prev_scroll = scroll_top
-                        
-                    await self.page.evaluate(
-                        f"() => {{"
-                        f"  const el = document.querySelectorAll('{sel}')[{idx}];"
-                        f"  if (el) {{"
-                        f"    el.scrollTop = 0;"
-                        f"    el.dispatchEvent(new Event('scroll'));"
-                        f"  }}"
-                        f"}}"
-                    )
-                    await self.page.wait_for_timeout(2000)
-                    print(f"DEBUG: Scrolled '{sel}' (index {idx}) fully.")
-            except Exception as exc:
-                print(f"DEBUG: Scroll error '{sel}': {exc}")
-
-    async def scrape_asset_assignments(self) -> Dict[str, Any]:
-        print("⏳ Waiting for Asset Assignment table rows to load...")
+    async def _extract_visible_rows_js(self) -> List[Dict[str, Any]]:
         try:
-            await self.page.wait_for_selector(
-                "tbody.p-datatable-tbody tr, tr.p-selectable-row, .p-datatable-table",
-                state="attached",
-                timeout=15000
-            )
-            await self.page.wait_for_timeout(2000)
-        except Exception as e:
-            print(f"⚠️ Timeout waiting for table rows: {e}")
-            return {"rows": [], "count": 0}
-
-        await self._scroll_table_fully()
-
-        try:
-            scraped_data = await self.page.evaluate(r"""() => {
+            return await self.page.evaluate(r"""() => {
                 const rows = [];
                 const cleanText = (str) => (str || '').replace(/\s+/g, ' ').trim();
+
+                // Dynamic column mapping based on thead th elements (with robust fallback)
+                const colMap = {
+                    priority: 0,
+                    wo: 1,
+                    customer: 2,
+                    address: 3,
+                    tags: 4,
+                    tech: 5,
+                    appointment: 6,
+                    created: 7,
+                    scheduled: 8,
+                    task: 9,
+                    purchase: 10
+                };
+
+                const ths = document.querySelectorAll('thead.p-datatable-thead th, table.p-datatable-table th');
+                if (ths && ths.length >= 5) {
+                    ths.forEach((th, idx) => {
+                        const txt = cleanText(th.textContent).toLowerCase();
+                        const titleEl = th.querySelector('.p-column-title');
+                        const titleTxt = cleanText(titleEl ? (titleEl.getAttribute('title') || titleEl.textContent) : '').toLowerCase();
+                        const full = `${txt} ${titleTxt}`;
+                        if (full.includes('priority')) {
+                            colMap.priority = idx;
+                        } else if (full.includes('tag')) {
+                            colMap.tags = idx;
+                        } else if (full.includes('wo') || full.includes('work order')) {
+                            colMap.wo = idx;
+                        } else if (full.includes('address')) {
+                            colMap.address = idx;
+                        } else if (full.includes('customer')) {
+                            colMap.customer = idx;
+                        } else if (full.includes('tech')) {
+                            colMap.tech = idx;
+                        } else if (full.includes('promised') || full.includes('appointment')) {
+                            colMap.appointment = idx;
+                        } else if (full.includes('created')) {
+                            colMap.created = idx;
+                        } else if (full.includes('scheduled')) {
+                            colMap.scheduled = idx;
+                        } else if (full.includes('task') || full.includes('duration')) {
+                            colMap.task = idx;
+                        } else if (full.includes('purchase') || full.includes('status')) {
+                            colMap.purchase = idx;
+                        }
+                    });
+                }
 
                 const domRows = document.querySelectorAll(
                     'tbody.p-datatable-tbody > tr.p-selectable-row, tbody.p-datatable-tbody > tr, tr.p-selectable-row'
@@ -597,54 +565,70 @@ class AssetAssignmentScraper(BaseScraper):
                 domRows.forEach((row) => {
                     try {
                         const cells = row.querySelectorAll('td');
-                        if (!cells || cells.length < 10) return;
+                        if (!cells || cells.length < 6) return;
 
-                        const colorEl = cells[0].querySelector('.priorityColor') || cells[0].querySelector('[style*="background-color"]');
+                        // 1. Priority Color & Name
+                        const prioCell = cells[colMap.priority] || cells[0];
+                        const colorEl = prioCell.querySelector('.priorityColor') || prioCell.querySelector('[style*="background-color"]');
                         const priorityColor = colorEl ? colorEl.style.backgroundColor : '';
-                        const colorTitle = colorEl ? (colorEl.getAttribute('title') || '') : '';
+                        const priorityName = colorEl ? (colorEl.getAttribute('title') || colorEl.textContent || '') : cleanText(prioCell.textContent);
 
-                        const priorityName = cleanText(cells[1].textContent) || colorTitle;
-
-                        const woEl = cells[2].querySelector('.dispatch-name') || cells[2];
+                        // 2. Work Order Number
+                        const woCell = cells[colMap.wo] || cells[1];
+                        const woEl = woCell.querySelector('.dispatch-name') || woCell;
                         const workOrderNumber = cleanText(woEl.getAttribute('title') || woEl.textContent);
                         if (!workOrderNumber) return;
 
-                        const customerName = cleanText(cells[3].textContent);
+                        // 3. Customer Name
+                        const custCell = cells[colMap.customer] || cells[2];
+                        const customerName = cleanText(custCell.textContent);
 
-                        const customerAddress = cleanText(cells[4].textContent);
+                        // 4. Customer Address
+                        const addrCell = cells[colMap.address] || cells[3];
+                        const customerAddress = addrCell ? cleanText(addrCell.textContent) : '';
 
-                        const tagsEl = cells[5].querySelector('.tag-list-container') || cells[5];
-                        const tags = cleanText(tagsEl.textContent);
+                        // 5. Tags
+                        const tagCell = cells[colMap.tags] || cells[4];
+                        const tagsEl = tagCell ? (tagCell.querySelector('.tag-list-container') || tagCell) : null;
+                        const tags = tagsEl ? cleanText(tagsEl.textContent) : '';
 
-                        const techName = cleanText(cells[6].textContent);
+                        // 6. Tech Name
+                        const techCell = cells[colMap.tech] || cells[5];
+                        const techName = techCell ? cleanText(techCell.textContent) : '';
 
-                        const promisedAppointment = cells.length > 7 ? cleanText(cells[7].textContent) : '';
+                        // 7. Promised Appointment
+                        const apptCell = cells[colMap.appointment] || cells[6];
+                        const promisedAppointment = apptCell ? cleanText(apptCell.textContent) : '';
 
-                        // Col 8: Created Date
-                        const createdDate = cells.length > 8 ? cleanText(cells[8].textContent) : '';
+                        // 8. Created Date
+                        const createdCell = cells[colMap.created] || cells[7];
+                        const createdDate = createdCell ? cleanText(createdCell.textContent) : '';
 
-                        // Col 9: Scheduled Date (e.g. 10/14/2026 5:00 AM - 6:00 AM)
+                        // 9. Scheduled Date (e.g. 12/11/2026 5:00 AM - 6:00 AM)
+                        const schedCell = cells[colMap.scheduled] || cells[8];
                         let scheduledDate = '';
-                        if (cells.length > 9) {
-                            const schedEl = cells[9].querySelector('.date-assignment') || cells[9];
+                        if (schedCell) {
+                            const schedEl = schedCell.querySelector('.date-assignment') || schedCell.querySelector('.date-hitbox span') || schedCell;
                             scheduledDate = cleanText(schedEl.getAttribute('title')) || cleanText(schedEl.textContent);
                         }
 
-                        // Col 10: Task & Duration
+                        // 10. Task & Duration
+                        const taskCell = cells[colMap.task] || cells[9];
                         let taskName = '';
                         let taskDuration = '';
-                        if (cells.length > 10) {
-                            const taskEl = cells[10].querySelector('.task-name');
-                            const durEl = cells[10].querySelector('.task-duration');
+                        if (taskCell) {
+                            const taskEl = taskCell.querySelector('.task-name');
+                            const durEl = taskCell.querySelector('.task-duration');
                             taskName = taskEl ? cleanText(taskEl.getAttribute('title') || taskEl.textContent) : '';
                             taskDuration = durEl ? cleanText(durEl.textContent) : '';
                             if (!taskName) {
-                                taskName = cleanText(cells[10].textContent);
+                                taskName = cleanText(taskCell.textContent);
                             }
                         }
 
-                        // Col 11: Purchase Status
-                        const purchaseStatus = cells.length > 11 ? cleanText(cells[11].textContent) : '';
+                        // 11. Purchase Status
+                        const purCell = cells[colMap.purchase] || cells[10];
+                        const purchaseStatus = purCell ? cleanText(purCell.textContent) : '';
 
                         // Asset / Vehicle metadata parsing
                         let assetName = '';
@@ -697,13 +681,122 @@ class AssetAssignmentScraper(BaseScraper):
                     }
                 });
 
-                return { rows: rows, count: rows.length };
-            }""");
+                return rows;
+            }""")
+        except Exception as e:
+            print(f"DEBUG: Error extracting visible rows: {e}")
+            return []
 
-            rows = scraped_data.get("rows", [])
-            count = len(rows)
-            print(f"✅ Successfully scraped {count} total rows from the table.")
+    async def scrape_asset_assignments(self) -> Dict[str, Any]:
+        print("⏳ Waiting for Asset Assignment table rows to load...")
+        try:
+            await self.page.wait_for_selector(
+                "tbody.p-datatable-tbody tr, tr.p-selectable-row, .p-datatable-table",
+                state="attached",
+                timeout=15000
+            )
+            await self.page.wait_for_timeout(1500)
+        except Exception as e:
+            print(f"⚠️ Timeout waiting for table rows: {e}")
+            return {"rows": [], "count": 0}
 
+        captured_rows: Dict[str, Dict[str, Any]] = {}
+
+        # 1. Capture initial visible rows at top
+        initial_rows = await self._extract_visible_rows_js()
+        for r in initial_rows:
+            wo_num = r.get("work_order_number")
+            if wo_num:
+                captured_rows[wo_num] = r
+
+        # 2. Scroll table incrementally while capturing virtualized rows at every step
+        selectors = [
+            ".p-datatable-wrapper",
+            ".p-datatable-scrollable-body",
+            "tbody.fixed-body",
+            ".fixed-body-container",
+            ".kgViewport",
+            ".grid-viewport",
+            ".ui-grid-viewport",
+            ".list-table-scroll-container",
+            ".scroll-container",
+        ]
+        scroll_found = False
+        for sel in selectors:
+            try:
+                count = await self.page.evaluate(f"() => document.querySelectorAll('{sel}').length")
+                if count == 0:
+                    continue
+
+                for idx in range(count):
+                    is_scrollable = await self.page.evaluate(
+                        f"() => {{"
+                        f"  const el = document.querySelectorAll('{sel}')[{idx}];"
+                        f"  return el && el.scrollHeight > el.clientHeight;"
+                        f"}}"
+                    )
+                    if not is_scrollable:
+                        continue
+
+                    scroll_found = True
+                    print(f"DEBUG: Scrolling '{sel}' (index {idx}) and capturing virtualized rows...")
+                    prev_scroll = -1
+                    stuck_count = 0
+                    for _ in range(500):
+                        scroll_top = await self.page.evaluate(
+                            f"() => {{"
+                            f"  const el = document.querySelectorAll('{sel}')[{idx}];"
+                            f"  if (el) {{"
+                            f"    el.scrollTop += 350;"
+                            f"    el.dispatchEvent(new Event('scroll'));"
+                            f"    return el.scrollTop;"
+                            f"  }}"
+                            f"  return -1;"
+                            f"}}"
+                        )
+                        await self.page.wait_for_timeout(250)
+
+                        step_rows = await self._extract_visible_rows_js()
+                        for r in step_rows:
+                            wo_num = r.get("work_order_number")
+                            if wo_num:
+                                captured_rows[wo_num] = r
+
+                        if scroll_top == prev_scroll:
+                            stuck_count += 1
+                            if stuck_count >= 3:
+                                break
+                        else:
+                            stuck_count = 0
+                        prev_scroll = scroll_top
+
+                    # Reset scroll position back to top
+                    await self.page.evaluate(
+                        f"() => {{"
+                        f"  const el = document.querySelectorAll('{sel}')[{idx}];"
+                        f"  if (el) {{"
+                        f"    el.scrollTop = 0;"
+                        f"    el.dispatchEvent(new Event('scroll'));"
+                        f"  }}"
+                        f"}}"
+                    )
+                    await self.page.wait_for_timeout(300)
+                    top_rows = await self._extract_visible_rows_js()
+                    for r in top_rows:
+                        wo_num = r.get("work_order_number")
+                        if wo_num:
+                            captured_rows[wo_num] = r
+
+                if scroll_found:
+                    break
+            except Exception as exc:
+                print(f"DEBUG: Scroll error on '{sel}': {exc}")
+
+        rows = list(captured_rows.values())
+        count = len(rows)
+        print(f"✅ Successfully scraped {count} total unique rows across all scroll steps.")
+
+        try:
             truck_assign_headers = self.filter_truck_assign_headers(rows)
             print(f"🎯 Extracted {len(truck_assign_headers)} active truck_assign_headers.")
 
@@ -738,7 +831,7 @@ class AssetAssignmentScraper(BaseScraper):
             return result_payload
 
         except Exception as e:
-            print(f"❌ Error scraping table rows: {e}")
+            print(f"❌ Error processing table rows: {e}")
             return {"truck_assign_headers": [], "count": 0, "error": str(e)}
 
     def filter_truck_assign_headers(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -822,26 +915,33 @@ class AssetAssignmentScraper(BaseScraper):
                 dept = matched_cfg.get("department") or ("pump" if ("🚛" in cust or "PT" in prio) else "service")
                 canonical_truck_name = matched_cfg.get("name") or cust
 
-                start_time = matched_cfg.get("start_time") or "06:00 AM"
+                # Template start_time is the canonical target; scraped board time is the CURRENT state.
+                # We always use the template's start_time as target (for reconciliation).
+                # Scraped board time is stored separately as current_start_time for comparison.
+                template_start_time = matched_cfg.get("start_time") or "06:00 AM"
                 duration = matched_cfg.get("duration") or "1:00"
                 sched_str = r.get("scheduled_date", "")
+                current_start_time = template_start_time  # default fallback
                 m = re.search(r"(\d{1,2}:\d{2}\s*[AP]M)\s*-\s*(\d{1,2}:\d{2}\s*[AP]M)", sched_str, re.IGNORECASE)
                 if m:
                     st = m.group(1).upper()
                     if len(st.split(":")[0]) == 1:
                         st = "0" + st
-                    start_time = st
+                    current_start_time = st
                 m_dur = re.search(r"\((\d+)\s*H\)", r.get("task_duration", ""), re.IGNORECASE)
                 if m_dur:
                     duration = f"{m_dur.group(1)}:00"
 
                 target_tech = matched_cfg.get("tech_name") or "None (Unassigned/Inactive)"
+                # priority: use template's target priority for reconciliation (not board's current priority)
+                target_priority = matched_cfg.get("priority") or prio or ""
                 truck_headers.append({
                     "name": canonical_truck_name,
                     "active": matched_cfg.get("active", True),
                     "department": dept,
-                    "priority": prio or matched_cfg.get("priority", ""),
-                    "start_time": start_time,
+                    "priority": target_priority,
+                    "start_time": template_start_time,
+                    "current_start_time": current_start_time,
                     "duration": duration,
                     "tech_name": tech,
                     "work_order_number": wo_num,
@@ -953,6 +1053,26 @@ class AssetAssignmentScraper(BaseScraper):
                     if t.get("active") is False:
                         return True
 
+        return False
+
+    @staticmethod
+    def is_static_asset_header(header_dict: Dict[str, Any]) -> bool:
+        if not header_dict or not isinstance(header_dict, dict):
+            return False
+        name = (header_dict.get("name") or "").strip()
+        prio = (header_dict.get("priority") or "").strip()
+        if not name:
+            return False
+        if name in (
+            "🚛| PUMP TRUCKS", "SERVICE TRUCKS 🛻", "▭TRAILERS",
+            "EXCAVATORS 🏗️", "👥 | SUPPORT", "⚠️ OUT OF SERVICE",
+            "🔧 SERVICE NEEDED", "👨‍🔧 | TECHNICIANS"
+        ):
+            return False
+        if name.startswith(".") or any(k in name for k in ("ATTENDANCE", "DUMP", "BREAK", "OPS", "REPORTS", "TRAINING", "STATUS")):
+            return False
+        if any(k in prio for k in ("Asset Assignment", "EXC (", "TRAI (", "LABORER (", "PT (", "SER TR (")):
+            return True
         return False
 
     async def close_sidepanel(self):
@@ -1472,6 +1592,8 @@ class AssetAssignmentScraper(BaseScraper):
         is_target_exc = ("🏗️" in asset_name or "u-40" in asset_name.lower() or "u-17" in asset_name.lower() or "exc" in asset_name.lower())
         is_target_pump = ("🚛" in asset_name or "pt (" in asset_name.lower() or "pump" in asset_name.lower())
         is_target_serv = ("🛻" in asset_name or "ser tr" in asset_name.lower() or "service" in asset_name.lower())
+        is_target_trai = ("▭" in asset_name or "t-" in asset_name.lower() or "tilt" in asset_name.lower() or "dump" in asset_name.lower() or "trai" in asset_name.lower())
+        is_target_labor = ("👥" in asset_name or "laborer" in asset_name.lower() or "helper" in asset_name.lower())
 
         ident_target = asset_name.split("|")[-1].strip() if "|" in asset_name else asset_name.strip()
         c_ident_target = self.canonical_str(ident_target)
@@ -1481,15 +1603,20 @@ class AssetAssignmentScraper(BaseScraper):
             cust = (r.get("customer_name") or "").strip()
             prio = (r.get("priority_name") or "").strip()
 
-            if "👥" in cust or "laborer" in cust.lower() or "helper" in cust.lower():
+            if not is_target_labor and ("👥" in cust or "laborer" in cust.lower() or "helper" in cust.lower()):
                 continue
 
-            is_vehicle = ("🛻" in cust or "🚛" in cust or "🏗️" in cust)
+            is_vehicle = bool(
+                "🛻" in cust or "🚛" in cust or "🏗️" in cust or "▭" in cust or
+                (is_target_labor and "👥" in cust) or
+                (is_target_exc and ("u-40" in cust.lower() or "u-17" in cust.lower())) or
+                (is_target_trai and ("t-" in cust.lower() or "tilt" in cust.lower() or "dump" in cust.lower()))
+            )
             if not is_vehicle and not r.get("is_asset_assignment"):
-                if not ("asset assignment" in prio.lower() or "ser tr" in prio.lower() or "pt (" in prio.lower() or "service needed" in prio.lower() or "exc (" in prio.lower() or "do not dispatch" in prio.lower()):
+                if not any(k in prio.lower() for k in ("asset assignment", "ser tr", "pt (", "service needed", "exc (", "trai (", "laborer (", "do not dispatch")):
                     continue
 
-            is_cust_exc = ("🏗️" in cust or "u-40" in cust.lower() or "u-17" in cust.lower() or "exc" in prio.lower() or "exc" in cust.lower())
+            is_cust_exc = bool("🏗️" in cust or "u-40" in cust.lower() or "u-17" in cust.lower() or "exc" in prio.lower() or "exc" in cust.lower())
             if is_target_exc != is_cust_exc:
                 continue
 
@@ -1511,7 +1638,7 @@ class AssetAssignmentScraper(BaseScraper):
 
                 if c_ident_target and c_ident_target == c_ident_cust:
                     is_match = True
-                elif not is_target_exc and not is_cust_exc:
+                elif not is_target_exc and not is_cust_exc and not is_target_trai and not is_target_labor:
                     cust_digits = re.findall(r'^\d+$', ident_cust)
                     targ_digits = re.findall(r'^\d+$', ident_target)
                     if cust_digits and targ_digits and int(cust_digits[0]) == int(targ_digits[0]):
@@ -1587,19 +1714,32 @@ class AssetAssignmentScraper(BaseScraper):
         import unicodedata, re
         norm_curr = re.sub(r'[^a-zA-Z0-9]', '', unicodedata.normalize('NFKD', str(current_priority))).lower()
         norm_target = re.sub(r'[^a-zA-Z0-9]', '', unicodedata.normalize('NFKD', str(target_priority))).lower()
-        if norm_curr == norm_target or (norm_target and norm_target in norm_curr) or (norm_curr and norm_curr in norm_target):
+        if norm_curr == norm_target:
+            return True
+
+        # Check numeric priority codes (e.g. 7.1 vs 7.12, 7.7 vs 7.11)
+        m_curr = re.search(r'\b\d+\.\d+\b', str(current_priority))
+        m_target = re.search(r'\b\d+\.\d+\b', str(target_priority))
+        if m_curr and m_target:
+            if m_curr.group(0) != m_target.group(0):
+                return False
+            # When both have identical numeric codes (e.g. 7.12 and 7.12):
+            curr_upper = str(current_priority).upper()
+            target_upper = str(target_priority).upper()
+            if "SERVICE NEEDED" in target_upper and "SERVICE NEEDED" not in curr_upper:
+                return False
+            if "DO NOT DISPATCH" in target_upper and "DO NOT DISPATCH" not in curr_upper:
+                return False
             return True
 
         curr_upper = str(current_priority).upper()
         target_upper = str(target_priority).upper()
-        if "SERVICE NEEDED" in target_upper and "SERVICE NEEDED" in curr_upper:
-            return True
-        if "DO NOT DISPATCH" in target_upper and "DO NOT DISPATCH" in curr_upper:
-            return True
+        if "SERVICE NEEDED" in target_upper:
+            return "SERVICE NEEDED" in curr_upper or "7.12" in str(current_priority)
+        if "DO NOT DISPATCH" in target_upper:
+            return "DO NOT DISPATCH" in curr_upper
 
-        m_curr = re.search(r'\b\d+\.\d+\b', str(current_priority))
-        m_target = re.search(r'\b\d+\.\d+\b', str(target_priority))
-        if m_curr and m_target and m_curr.group(0) == m_target.group(0):
+        if norm_target and norm_target in norm_curr:
             return True
 
         return False
@@ -1969,20 +2109,67 @@ class AssetAssignmentScraper(BaseScraper):
                     prio_clicked = await self.page.evaluate("""(target) => {
                         const norm = (s) => (s || '').normalize('NFKD').toLowerCase().replace(/[^a-z0-9]/g, '');
                         const cTarget = norm(target);
+                        const mTarget = target.match(/\\b\\d+\\.\\d+\\b/);
+                        const targetCode = mTarget ? mTarget[0] : null;
                         const isDnd = target.toUpperCase().includes('DO NOT DISPATCH') || target.includes('[4]');
                         const isSn = target.toUpperCase().includes('SERVICE NEEDED') || target.includes('7.12');
 
                         const items = Array.from(document.querySelectorAll('.vs__dropdown-menu li, li.vs__dropdown-option, ul[role="listbox"] li, .vs__dropdown-menu .vs__dropdown-option'));
+
+                        // Pass 1: Strict exact normalized match
                         for (const item of items) {
                             const txt = (item.textContent || '').trim();
                             const cTxt = norm(txt);
+                            if (cTxt && cTxt === cTarget) {
+                                item.scrollIntoView({ behavior: 'instant', block: 'nearest' });
+                                item.click();
+                                item.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                                return true;
+                            }
+                        }
 
-                            const exactMatch = cTxt === cTarget;
-                            const subMatch = cTarget && (cTxt.includes(cTarget) || cTarget.includes(cTxt));
-                            const dndMatch = isDnd && (txt.toUpperCase().includes('DO NOT DISPATCH') || txt.includes('[4]'));
-                            const snMatch = isSn && (txt.toUpperCase().includes('SERVICE NEEDED') || txt.includes('7.12'));
+                        // Pass 2: Strict code & keyword match (never match prefix or different numeric code)
+                        for (const item of items) {
+                            const txt = (item.textContent || '').trim();
+                            const cTxt = norm(txt);
+                            const mTxt = txt.match(/\\b\\d+\\.\\d+\\b/);
+                            const txtCode = mTxt ? mTxt[0] : null;
 
-                            if (exactMatch || subMatch || dndMatch || snMatch) {
+                            // STRICT SAFETY: Never match different numeric priority codes (e.g. 7.1 vs 7.12)
+                            if (targetCode && txtCode && targetCode !== txtCode) {
+                                continue;
+                            }
+
+                            if (isSn) {
+                                const txtUpper = txt.toUpperCase();
+                                if ((txtUpper.includes('SERVICE NEEDED') || txt.includes('7.12')) && (!txtCode || txtCode === '7.12')) {
+                                    item.scrollIntoView({ behavior: 'instant', block: 'nearest' });
+                                    item.click();
+                                    item.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                                    return true;
+                                }
+                                continue;
+                            }
+
+                            if (isDnd) {
+                                const txtUpper = txt.toUpperCase();
+                                if (txtUpper.includes('DO NOT DISPATCH') || txt.includes('[4]')) {
+                                    item.scrollIntoView({ behavior: 'instant', block: 'nearest' });
+                                    item.click();
+                                    item.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                                    return true;
+                                }
+                                continue;
+                            }
+
+                            if (targetCode && txtCode && targetCode === txtCode) {
+                                item.scrollIntoView({ behavior: 'instant', block: 'nearest' });
+                                item.click();
+                                item.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                                return true;
+                            }
+
+                            if (cTarget && cTxt && cTxt.includes(cTarget)) {
                                 item.scrollIntoView({ behavior: 'instant', block: 'nearest' });
                                 item.click();
                                 item.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
@@ -1993,7 +2180,13 @@ class AssetAssignmentScraper(BaseScraper):
                     }""", target_priority)
 
                     if not prio_clicked:
-                        search_term = "DO NOT DISPATCH" if "DO NOT DISPATCH" in target_priority.upper() else ("SERVICE NEEDED" if "SERVICE NEEDED" in target_priority.upper() else target_priority)
+                        if "SERVICE NEEDED" in target_priority.upper() or "7.12" in target_priority:
+                            search_term = "7.12 SERVICE NEEDED"
+                        elif "DO NOT DISPATCH" in target_priority.upper():
+                            search_term = "DO NOT DISPATCH"
+                        else:
+                            search_term = target_priority
+
                         try:
                             prio_inp = self.page.locator('input.vs__search:visible, input[type="search"]:visible').first
                             if await prio_inp.count() > 0 and await prio_inp.is_visible():
@@ -2017,20 +2210,64 @@ class AssetAssignmentScraper(BaseScraper):
                         prio_clicked = await self.page.evaluate("""(target) => {
                             const norm = (s) => (s || '').normalize('NFKD').toLowerCase().replace(/[^a-z0-9]/g, '');
                             const cTarget = norm(target);
+                            const mTarget = target.match(/\\b\\d+\\.\\d+\\b/);
+                            const targetCode = mTarget ? mTarget[0] : null;
                             const isDnd = target.toUpperCase().includes('DO NOT DISPATCH') || target.includes('[4]');
                             const isSn = target.toUpperCase().includes('SERVICE NEEDED') || target.includes('7.12');
 
                             const items = Array.from(document.querySelectorAll('.vs__dropdown-menu li, li.vs__dropdown-option, ul[role="listbox"] li, .vs__dropdown-menu .vs__dropdown-option'));
+
                             for (const item of items) {
                                 const txt = (item.textContent || '').trim();
                                 const cTxt = norm(txt);
+                                if (cTxt && cTxt === cTarget) {
+                                    item.scrollIntoView({ behavior: 'instant', block: 'nearest' });
+                                    item.click();
+                                    item.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                                    return true;
+                                }
+                            }
 
-                                const exactMatch = cTxt === cTarget;
-                                const subMatch = cTarget && (cTxt.includes(cTarget) || cTarget.includes(cTxt));
-                                const dndMatch = isDnd && (txt.toUpperCase().includes('DO NOT DISPATCH') || txt.includes('[4]'));
-                                const snMatch = isSn && (txt.toUpperCase().includes('SERVICE NEEDED') || txt.includes('7.12'));
+                            for (const item of items) {
+                                const txt = (item.textContent || '').trim();
+                                const cTxt = norm(txt);
+                                const mTxt = txt.match(/\\b\\d+\\.\\d+\\b/);
+                                const txtCode = mTxt ? mTxt[0] : null;
 
-                                if (exactMatch || subMatch || dndMatch || snMatch) {
+                                if (targetCode && txtCode && targetCode !== txtCode) {
+                                    continue;
+                                }
+
+                                if (isSn) {
+                                    const txtUpper = txt.toUpperCase();
+                                    if ((txtUpper.includes('SERVICE NEEDED') || txt.includes('7.12')) && (!txtCode || txtCode === '7.12')) {
+                                        item.scrollIntoView({ behavior: 'instant', block: 'nearest' });
+                                        item.click();
+                                        item.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                                        return true;
+                                    }
+                                    continue;
+                                }
+
+                                if (isDnd) {
+                                    const txtUpper = txt.toUpperCase();
+                                    if (txtUpper.includes('DO NOT DISPATCH') || txt.includes('[4]')) {
+                                        item.scrollIntoView({ behavior: 'instant', block: 'nearest' });
+                                        item.click();
+                                        item.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                                        return true;
+                                    }
+                                    continue;
+                                }
+
+                                if (targetCode && txtCode && targetCode === txtCode) {
+                                    item.scrollIntoView({ behavior: 'instant', block: 'nearest' });
+                                    item.click();
+                                    item.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                                    return true;
+                                }
+
+                                if (cTarget && cTxt && cTxt.includes(cTarget)) {
                                     item.scrollIntoView({ behavior: 'instant', block: 'nearest' });
                                     item.click();
                                     item.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
@@ -2043,7 +2280,12 @@ class AssetAssignmentScraper(BaseScraper):
                     if not prio_clicked:
                         try:
                             import re as _re
-                            pat = r'do\s*not\s*dispatch|\[4\]' if ('DO NOT DISPATCH' in target_priority.upper() or '[4]' in target_priority) else r'service\s*needed|7\.12'
+                            if 'DO NOT DISPATCH' in target_priority.upper() or '[4]' in target_priority:
+                                pat = r'do\s*not\s*dispatch|\[4\]'
+                            elif 'SERVICE NEEDED' in target_priority.upper() or '7.12' in target_priority:
+                                pat = r'service\s*needed|\b7\.12\b'
+                            else:
+                                pat = _re.escape(target_priority)
                             opt_loc = self.page.locator('.vs__dropdown-menu li, ul[role="listbox"] li, li.vs__dropdown-option').filter(has_text=_re.compile(pat, _re.I)).first
                             if await opt_loc.count() > 0 and await opt_loc.is_visible():
                                 await opt_loc.click(force=True)
@@ -2061,11 +2303,20 @@ class AssetAssignmentScraper(BaseScraper):
                         prio_clicked = await self.page.evaluate("""(target) => {
                             const isDnd = target.toUpperCase().includes('DO NOT DISPATCH') || target.includes('[4]');
                             const isSn = target.toUpperCase().includes('SERVICE NEEDED') || target.includes('7.12');
+                            const mTarget = target.match(/\\b\\d+\\.\\d+\\b/);
+                            const targetCode = mTarget ? mTarget[0] : null;
+
                             const items = Array.from(document.querySelectorAll('.vs__dropdown-menu li, li.vs__dropdown-option, ul[role="listbox"] li, .vs__dropdown-menu .vs__dropdown-option'));
                             for (const item of items) {
                                 const txt = (item.textContent || '').trim();
+                                const mTxt = txt.match(/\\b\\d+\\.\\d+\\b/);
+                                const txtCode = mTxt ? mTxt[0] : null;
+
+                                if (targetCode && txtCode && targetCode !== txtCode) {
+                                    continue;
+                                }
                                 const dndMatch = isDnd && (txt.toUpperCase().includes('DO NOT DISPATCH') || txt.includes('[4]'));
-                                const snMatch = isSn && (txt.toUpperCase().includes('SERVICE NEEDED') || txt.includes('7.12'));
+                                const snMatch = isSn && (txt.toUpperCase().includes('SERVICE NEEDED') || txt.includes('7.12')) && (!txtCode || txtCode === '7.12');
                                 if (dndMatch || snMatch) {
                                     item.scrollIntoView({ behavior: 'instant', block: 'nearest' });
                                     item.click();
@@ -2078,6 +2329,23 @@ class AssetAssignmentScraper(BaseScraper):
 
                     print(f"  -> Priority option selected: {'Success' if prio_clicked else 'Option not found'}")
                     await self.page.wait_for_timeout(200)
+                    try:
+                        selected_prio_val = await self.page.evaluate("""() => {
+                            const cells = Array.from(document.querySelectorAll('[data-edb-sidepanel-card*="WorkOrder"] .cell, .workorder-details-card_kiboz .cell, .cell'));
+                            for (const c of cells) {
+                                const t = c.querySelector('.field-title, .title');
+                                if (t && (t.textContent || '').trim().toLowerCase().includes('priority')) {
+                                    const sel = c.querySelector('.vs__selected');
+                                    if (sel && sel.textContent) return sel.textContent.trim();
+                                }
+                            }
+                            const vs = document.querySelector('[data-edb-sidepanel-card*="WorkOrder"] .cell:has(.field-title:has-text("Priority")) .v-select');
+                            return vs ? (vs.querySelector('.vs__selected')?.textContent || '').trim() : '';
+                        }""")
+                        if selected_prio_val:
+                            print(f"  🏷️ Current Priority in dropdown: '{selected_prio_val}'")
+                    except Exception:
+                        pass
                 else:
                     print(f"  🏷️ Priority already set to '{target_priority}'. Skipping priority selection.")
 
@@ -2718,13 +2986,15 @@ class AssetAssignmentScraper(BaseScraper):
                         print(f"  ⚠️ Could not find card for Out of Service vehicle '{asset_name}' on {normalized_date}.")
 
             if out_of_service_names and truck_headers:
-                oos_on_tech = [
+                # OOS vehicles on a real tech (non-s4/s3) → cancel (wrong place).
+                # OOS vehicles already on s4/s3/blank → just update time, keep OOS priority in place.
+                oos_on_wrong_tech = [
                     r for r in truck_headers
                     if (self.canonical_str(r.get("name", "")) in out_of_service_names
                         or self.canonical_str(r.get("asset_name", "")) in out_of_service_names)
-                    and r.get("tech_name", "").lower() not in ("s4", "s3", "")
+                    and (r.get("tech_name") or "").strip().lower() not in ("s4", "s3", "")
                 ]
-                for r in oos_on_tech:
+                for r in oos_on_wrong_tech:
                     wo_num = r.get("work_order_number")
                     t_name = r.get("name", "")
                     t_tech = r.get("tech_name", "")
@@ -2737,6 +3007,8 @@ class AssetAssignmentScraper(BaseScraper):
                         if canceled:
                             print(f"🗑️ Cancelled Out of Service vehicle WO #{wo_num} ({t_name}) on '{t_tech}'.")
                             total_reconciled += 1
+                # Remove ALL OOS trucks from truck_headers so Stage 2/3 don't touch them.
+                # OOS s4 tracking WO is managed exclusively by Stage 0.
                 truck_headers = [
                     r for r in truck_headers
                     if self.canonical_str(r.get("name", "")) not in out_of_service_names
@@ -2750,12 +3022,14 @@ class AssetAssignmentScraper(BaseScraper):
             if service_needed_configs and click_wos:
                 print(f"\n🔧 [Stage 1/3] Checking {len(service_needed_configs)} active service-needed assets on {normalized_date}...")
                 for sn_cfg in service_needed_configs:
-                    asset_name = sn_cfg.get("asset_name", "")
+                    asset_name = (sn_cfg.get("name") or sn_cfg.get("asset_name") or "").strip()
                     matched_truck = next((
                         t for t in self.template_data.get("truck_assign_headers", [])
                         if (self.canonical_str(t.get("name", "")) == self.canonical_str(asset_name) or
                             (re.findall(r'\d+', t.get("name", "")) and re.findall(r'\d+', asset_name) and
-                             int(re.findall(r'\d+', t.get("name", ""))[0]) == int(re.findall(r'\d+', asset_name)[0])))
+                             int(re.findall(r'\d+', t.get("name", ""))[0]) == int(re.findall(r'\d+', asset_name)[0]) and
+                             ("🚛" in t.get("name", "")) == ("🚛" in asset_name) and
+                             ("🛻" in t.get("name", "")) == ("🛻" in asset_name)))
                     ), None)
                     is_assigned_to_tech = bool(
                         matched_truck and
@@ -2763,42 +3037,32 @@ class AssetAssignmentScraper(BaseScraper):
                         matched_truck.get("tech_name") and
                         matched_truck.get("tech_name").strip().lower() not in ("", "s4", "s3")
                     )
-                    if is_assigned_to_tech:
-                        target_tech = matched_truck.get("tech_name")
-                        target_time = matched_truck.get("start_time") or "06:00 AM"
-                    else:
-                        target_tech = sn_cfg.get("tech_name", "s4")
-                        target_time = sn_cfg.get("start_time") or "06:00 AM"
-                    target_priority = sn_cfg.get("priority", "[7] 7.12 SERVICE NEEDED")
+                    # Service Needed: always use s4 as target tech for the tracking WO.
+                    # The tech assignment WO (e.g. Mackie's truck WO) is managed by Stage 3 — do NOT touch it here.
+                    # We only manage the s4 SERVICE NEEDED tracking WO in Stage 1.
+                    target_tech = sn_cfg.get("tech_name") or "s4"
+                    target_time = sn_cfg.get("start_time") or "3:30 PM"
+                    target_priority = sn_cfg.get("priority") or "[7] 7.12 SERVICE NEEDED"
                     service_note = sn_cfg.get("service_note", "")
 
                     if is_assigned_to_tech:
-                        s4_dupes = []
-                        c_a_name = self.canonical_str(asset_name)
-                        nums_a = re.findall(r'\d+', asset_name)
-                        for r in all_rows:
-                            r_cust = (r.get("customer_name") or "").strip()
-                            r_tech = (r.get("tech_name") or "").strip().lower()
-                            r_wo = r.get("work_order_number")
-                            if r_tech in ("s4", "s3", "") and r_wo:
-                                c_r_cust = self.canonical_str(r_cust)
-                                nums_r = re.findall(r'\d+', r_cust)
-                                num_match = bool(nums_r and nums_a and int(nums_r[0]) == int(nums_a[0]))
-                                if c_r_cust == c_a_name or num_match:
-                                    s4_dupes.append(r)
-
-                        for dupe_r in s4_dupes:
-                            dupe_wo = dupe_r.get("work_order_number")
-                            print(f"🗑️ Found duplicate service needed WO #{dupe_wo} for '{asset_name}' on s4. Asset is assigned to tech '{target_tech}'. Cancelling duplicate...")
-                            canceled = await self.cancel_work_order_via_list(
-                                wo_number=dupe_wo,
-                                reason=f"Duplicate service needed asset '{asset_name}' on s4; asset is assigned to technician '{target_tech}'."
-                            )
-                            if canceled:
-                                all_rows = [x for x in all_rows if str(x.get("work_order_number")) != str(dupe_wo)]
-                                total_reconciled += 1
-
-                    matching_row = self.find_asset_row(asset_name, all_rows, target_priority=target_priority, target_tech=target_tech)
+                        # Truck is assigned to a real tech — that assignment stays.
+                        # Do NOT cancel the s4 SERVICE NEEDED WO; it tracks the issue independently.
+                        # Just ensure the s4 SERVICE NEEDED WO is set correctly below.
+                        assigned_tech_name = matched_truck.get('tech_name')
+                        print(f"  ℹ️ '{asset_name}' is assigned to '{assigned_tech_name}' but also SERVICE NEEDED. Keeping tech assignment; updating s4 tracking WO only.")
+                        # CRITICAL: Only search rows on s4/s3/unassigned or existing Service Needed rows
+                        # so we NEVER steal the technician's daily truck WO!
+                        s4_rows = [
+                            r for r in all_rows
+                            if (r.get("tech_name", "").strip().lower() in ("s4", "s3", "") or
+                                "SERVICE NEEDED" in (r.get("priority_name") or "").upper() or
+                                "7.12" in (r.get("priority_name") or "")) and
+                            not self.is_tech_match(r.get("tech_name", ""), assigned_tech_name)
+                        ]
+                        matching_row = self.find_asset_row(asset_name, s4_rows, target_priority=target_priority, target_tech=target_tech)
+                    else:
+                        matching_row = self.find_asset_row(asset_name, all_rows, target_priority=target_priority, target_tech=target_tech)
                     if matching_row:
                         wo_num = matching_row.get("work_order_number", "")
                         curr_tech = matching_row.get("tech_name", "")
@@ -2832,8 +3096,125 @@ class AssetAssignmentScraper(BaseScraper):
                     else:
                         print(f"  ⚠️ Could not find card for service-needed asset '{asset_name}' on {normalized_date}.")
 
-            if truck_headers:
-                print(f"\n🚛 [Stage 2/2] Standard Truck Reconciliation: Found {len(truck_headers)} truck_assign_headers on {normalized_date}:")
+            # Stage 2: Static Fleet Assets Reconciliation (Excavators 🏗️, Trailers ▭, Laborers 👥, Static Trucks on s4)
+            static_asset_headers = []
+            for h in self.template_data.get("static_headers", []):
+                if not h.get("active", True):
+                    continue
+                if self.is_static_asset_header(h):
+                    name = (h.get("name") or "").strip()
+                    c_n = self.canonical_str(name)
+                    if c_n in out_of_service_names:
+                        continue
+                    if any(self.canonical_str(sn.get("name") or sn.get("asset_name") or "") == c_n for sn in service_needed_configs):
+                        continue
+                    # Only skip if truck_assign_headers has this truck on a real tech
+                    # AND the board WO for that truck already has correct tech + correct time.
+                    # If time is wrong (even though tech matches), still process it.
+                    matched_assign_cfg = next((
+                        t for t in self.template_data.get("truck_assign_headers", [])
+                        if t.get("active", True)
+                        and t.get("tech_name", "").strip().lower() not in ("", "s4", "s3")
+                        and (
+                            self.canonical_str(t.get("name", "")) == c_n or
+                            (re.findall(r'\d+', t.get("name", "")) and re.findall(r'\d+', name) and
+                             int(re.findall(r'\d+', t.get("name", ""))[0]) == int(re.findall(r'\d+', name)[0]) and
+                             ("🚛" in t.get("name", "")) == ("🚛" in name) and
+                             ("🛻" in t.get("name", "")) == ("🛻" in name))
+                        )
+                    ), None)
+
+                    if matched_assign_cfg:
+                        assigned_tech = matched_assign_cfg.get("tech_name", "")
+                        static_target_time = h.get("start_time", "")
+                        # Look for a board WO matching this truck on the assigned tech
+                        board_row = next((
+                            r for r in all_rows
+                            if self.is_tech_match(r.get("tech_name", ""), assigned_tech)
+                            and (
+                                self.canonical_str(r.get("customer_name", "")) == c_n or
+                                self.canonical_str(r.get("name", "")) == c_n or
+                                (re.findall(r'\d+', r.get("customer_name", "")) and re.findall(r'\d+', name) and
+                                 int(re.findall(r'\d+', r.get("customer_name", ""))[0]) == int(re.findall(r'\d+', name)[0]))
+                            )
+                        ), None)
+                        if board_row:
+                            curr_time = board_row.get("scheduled_date", "")
+                            if self.is_time_matching(static_target_time, curr_time):
+                                # Tech AND time both match — skip ✅
+                                continue
+                            # Time mismatch — fall through to fix it
+                        # No board row found on assigned tech — fall through to process
+
+                    static_asset_headers.append(h)
+
+            if static_asset_headers and click_wos:
+                print(f"\n🏗️ [Stage 2/3] Checking {len(static_asset_headers)} static fleet assets (Excavators, Trailers, Laborers, s4 assets) on {normalized_date}...")
+                for st_cfg in static_asset_headers:
+                    asset_name = (st_cfg.get("name") or "").strip()
+                    target_time = st_cfg.get("start_time") or ""
+                    target_priority = st_cfg.get("priority") or ""
+                    target_tech = st_cfg.get("tech_name") or "s4"
+
+                    matching_row = self.find_asset_row(asset_name, all_rows, target_priority=target_priority, target_tech=target_tech)
+                    if matching_row:
+                        wo_num = matching_row.get("work_order_number", "")
+                        curr_tech = matching_row.get("tech_name", "")
+                        curr_sched = matching_row.get("scheduled_date", "")
+                        curr_prio = matching_row.get("priority_name", "")
+
+                        is_tech_set = not target_tech or self.is_tech_match(curr_tech, target_tech) or (self.canonical_str(curr_tech) == self.canonical_str(target_tech))
+                        is_time_set = not target_time or self.is_time_matching(target_time, curr_sched)
+                        is_prio_set = not target_priority or self.is_priority_match(curr_prio, target_priority)
+
+                        if is_tech_set and is_time_set and is_prio_set:
+                            print(f"  ⏭️ WO #{wo_num} for Static Asset '{asset_name}' is ALREADY fully set (Tech: '{curr_tech}', Time: '{curr_sched}', Priority: '{curr_prio}'). Skipping sidepanel.")
+                            continue
+
+                        print(f"  👉 Found existing WO #{wo_num} for '{asset_name}': Current Time '{curr_sched}' (expected '{target_time}'), Current Priority '{curr_prio}' (expected '{target_priority}'). Reconciling...")
+                        total_checked += 1
+                        updated = await self.update_service_needed_work_order(
+                            work_order_number=wo_num,
+                            asset_name=asset_name,
+                            target_time=target_time,
+                            target_priority=target_priority,
+                            service_note="",
+                            target_tech=target_tech,
+                            current_tech=curr_tech,
+                            current_sched=curr_sched,
+                            current_priority=curr_prio,
+                            stage_label="Static Asset Update"
+                        )
+                        if updated:
+                            total_reconciled += 1
+                    else:
+                        print(f"  ⚠️ Could not find card for static asset '{asset_name}' on {normalized_date}.")
+
+            # Stage 3: Universal Truck Reconciliation
+            # Source of truth = JSON truck_assign_headers (active entries with real tech).
+            # For each JSON entry, find matching board WO and reconcile.
+            # This handles: JSON changes (tech/time/priority), new trucks, re-assignments.
+            # Exclude trucks already handled by service_needed or OOS stages.
+            sn_names = {
+                self.canonical_str(s.get("name") or s.get("asset_name") or "")
+                for s in service_needed_configs
+            }
+            sn_nums = {
+                re.findall(r'\d+', s.get("name") or s.get("asset_name") or "")[0]
+                for s in service_needed_configs
+                if re.findall(r'\d+', s.get("name") or s.get("asset_name") or "")
+            }
+            active_truck_cfgs = [
+                t for t in self.template_data.get("truck_assign_headers", [])
+                if t.get("active", True)
+                and t.get("tech_name", "").strip().lower() not in ("", "s4", "s3")
+                # Do NOT skip trucks in service_needed_configs: they MUST be assigned to their tech!
+                # skip trucks that are out-of-service (handled by Stage 0)
+                and self.canonical_str(t.get("name", "")) not in out_of_service_names
+            ]
+
+            if active_truck_cfgs or truck_headers:
+                print(f"\n🚛 [Stage 3/3] Universal Truck Reconciliation: {len(active_truck_cfgs)} JSON entries, {len(truck_headers)} board WOs on {normalized_date}:")
                 for r in truck_headers:
                     try:
                         print(f"  - {r['name']} -> Current Tech: {r['tech_name']} | WO #{r['work_order_number']}")
@@ -2842,6 +3223,7 @@ class AssetAssignmentScraper(BaseScraper):
                         safe_tech = str(r.get('tech_name', '')).encode('ascii', errors='replace').decode()
                         print(f"  - {safe_name} -> Current Tech: {safe_tech} | WO #{r.get('work_order_number')}")
 
+                # --- Step A: Cancel duplicate trucks per tech (board has more than JSON allows) ---
                 tech_to_trucks = {}
                 for r in truck_headers:
                     t_name = r.get("name", "")
@@ -2850,151 +3232,231 @@ class AssetAssignmentScraper(BaseScraper):
                     if not ("🚛" in t_name or "🛻" in t_name):
                         continue
                     c_tech = self.canonical_str(r.get("tech_name", ""))
-                    if c_tech:
-                        if c_tech not in tech_to_trucks:
-                            tech_to_trucks[c_tech] = []
-                        tech_to_trucks[c_tech].append(r)
+                    # Only check real technician columns for duplicate trucks (exclude s4/s3 staging lanes)
+                    if not c_tech or c_tech in ("s4", "s3", "f2", "p2", "") or c_tech.startswith("s4") or c_tech.startswith("s3"):
+                        continue
+                    if c_tech not in tech_to_trucks:
+                        tech_to_trucks[c_tech] = []
+                    tech_to_trucks[c_tech].append(r)
 
                 for c_tech, t_list in tech_to_trucks.items():
                     if len(t_list) > 1:
                         tech_display = t_list[0].get("tech_name", "")
-                        print(f"\n⚠️ Technician '{tech_display}' has {len(t_list)} truck assignments on board: {[t.get('name') for t in t_list]}")
-
                         expected_truck_cfg = self.get_expected_truck_for_tech(tech_display)
                         expected_truck_name = expected_truck_cfg.get("name", "") if expected_truck_cfg else ""
                         c_exp_truck = self.canonical_str(expected_truck_name)
-
-                        print(f"  🎯 Template expected truck for '{tech_display}' is: '{expected_truck_name}'")
-
+                        print(f"\n⚠️ Technician '{tech_display}' has {len(t_list)} truck assignments: {[t.get('name') for t in t_list]}")
+                        print(f"  🎯 Expected truck for '{tech_display}': '{expected_truck_name}'")
                         matched_found = False
                         for r_truck in t_list:
                             t_name = r_truck.get("name", "")
                             c_t_name = self.canonical_str(t_name)
                             wo_num = r_truck.get("work_order_number", "")
-
-                            is_match = (
-                                c_exp_truck and (
-                                    c_t_name == c_exp_truck or
-                                    c_exp_truck in c_t_name or
-                                    c_t_name in c_exp_truck
-                                )
-                            )
+                            is_match = c_exp_truck and (c_t_name == c_exp_truck or c_exp_truck in c_t_name or c_t_name in c_exp_truck)
                             if is_match and not matched_found:
                                 matched_found = True
-                                print(f"  ✅ Truck '{t_name}' (WO #{wo_num}) matches JSON template for '{tech_display}'.")
+                                print(f"  ✅ '{t_name}' (WO #{wo_num}) matches JSON for '{tech_display}'.")
                             else:
-                                print(f"  ℹ️ Truck '{t_name}' (WO #{wo_num}) on '{tech_display}' does not match expected '{expected_truck_name}'. Initiating cancellation...")
+                                print(f"  ℹ️ '{t_name}' (WO #{wo_num}) is extra on '{tech_display}'. Cancelling...")
                                 if click_wos and wo_num:
-                                    success = await self.cancel_work_order_via_list(
-                                        wo_number=wo_num,
-                                        reason=f"Extra/mismatched truck '{t_name}' on tech '{tech_display}' (expected '{expected_truck_name}')."
-                                    )
+                                    success = await self.cancel_work_order_via_list(wo_number=wo_num, reason=f"Extra truck '{t_name}' on '{tech_display}' (expected '{expected_truck_name}').")
                                     if success:
-                                        print(f"  🗑️ Cancelled extra/mismatched truck WO #{wo_num} ({t_name}) on '{tech_display}'.")
+                                        print(f"  🗑️ Cancelled WO #{wo_num} ({t_name}).")
                                         truck_headers = [h for h in truck_headers if str(h.get("work_order_number")) != str(wo_num)]
                                         total_reconciled += 1
-                                    else:
-                                        print(f"  ⚠️ Could not cancel WO #{wo_num} ({t_name}) on '{tech_display}'. Preserving.")
-                                else:
-                                    print(f"  ℹ️ Cancellation skipped (click_wos={click_wos}, wo_num={wo_num}).")
 
-                truck_to_wos = {}
-                for r in truck_headers:
-                    t_name = r.get("name", "")
-                    if "👥" in t_name or "helper" in t_name.lower() or "laborer" in t_name.lower():
-                        continue
-                    if not ("🚛" in t_name or "🛻" in t_name):
-                        continue
-                    c_truck = self.canonical_str(t_name)
-                    if c_truck:
-                        if c_truck not in truck_to_wos:
-                            truck_to_wos[c_truck] = []
-                        truck_to_wos[c_truck].append(r)
-
-                for c_truck, w_list in truck_to_wos.items():
-                    if len(w_list) > 1:
-                        truck_display = w_list[0].get("name", "")
-                        expected_tech = self.get_expected_tech_for_truck(truck_display)
-
-                        print(f"\n⚠️ Truck '{truck_display}' appears on {len(w_list)} work orders across technicians: {[w.get('work_order_number') for w in w_list]}")
-                        print(f"  🎯 Expected technician for '{truck_display}' is: '{expected_tech or 'None'}'")
-
-                        for w in w_list:
-                            wo_num = w.get("work_order_number")
-                            t_tech = w.get("tech_name")
-                            if expected_tech and self.is_tech_match(t_tech or "", expected_tech):
-                                print(f"  ✅ WO #{wo_num} for '{truck_display}' is on expected tech '{t_tech}'.")
-                            else:
-                                print(f"  ℹ️ WO #{wo_num} for '{truck_display}' is on '{t_tech}'.")
-
+                # --- Step B: JSON-driven reconciliation — iterate JSON, find board row, reconcile ---
                 if click_wos:
-                    print(f"\n🖱️ Reconciling {len(truck_headers)} truck work orders with Dashboard config for {normalized_date}...")
-                    for idx, r in enumerate(truck_headers, 1):
-                        wo_num = r.get("work_order_number")
-                        truck_name = r.get("name")
-                        curr_tech_table = r.get("tech_name", "")
-                        is_completed = r.get("is_completed", False)
+                    # Build a quick lookup: canonical truck name → list of board WOs
+                    board_truck_map: dict = {}
+                    for r in truck_headers:
+                        t_name = r.get("name", "")
+                        c_t = self.canonical_str(t_name)
+                        nums = re.findall(r'\d+', t_name)
+                        if c_t:
+                            board_truck_map.setdefault(c_t, []).append(r)
+                        if nums:
+                            board_truck_map.setdefault(nums[0], []).append(r)
 
-                        if self.is_item_turned_off_in_dashboard(truck_name, curr_tech_table):
-                            if not is_completed:
-                                print(f"[{idx}/{len(truck_headers)}] 🚨 Truck '{truck_name}' (WO #{wo_num} on tech '{curr_tech_table}') is turned OFF / Out of Service in Dashboard template! Initiating auto-cancellation...")
-                                if click_wos and wo_num:
-                                    canceled = await self.cancel_work_order_via_list(
-                                        wo_number=wo_num,
-                                        reason=f"Vehicle '{truck_name}' is turned OFF / Out of Service in Dashboard template."
-                                    )
-                                    if canceled:
-                                        print(f"[{idx}/{len(truck_headers)}] 🗑️ Cancelled turned-off truck WO #{wo_num} ({truck_name}) on '{curr_tech_table}'.")
-                                        total_reconciled += 1
-                                        continue
+                    # Also handle board WOs NOT covered by any active JSON entry (stale/extra)
+                    json_covered_wos: set = set()
+
+                    print(f"\n🖱️ [JSON-driven] Reconciling {len(active_truck_cfgs)} JSON truck entries against board for {normalized_date}...")
+                    for idx, truck_cfg in enumerate(active_truck_cfgs, 1):
+                        truck_name    = truck_cfg.get("name", "")
+                        expected_tech = truck_cfg.get("tech_name", "").strip()
+                        target_time   = truck_cfg.get("start_time") or "06:00 AM"
+                        target_priority = truck_cfg.get("priority") or ("[5] PT (Asset Assignment)" if "🚛" in truck_name else "[5] SER TR (Asset Assignment)")
+                        c_truck_name  = self.canonical_str(truck_name)
+                        nums_cfg      = re.findall(r'\d+', truck_name)
+
+                        if self.is_item_turned_off_in_dashboard(truck_name, expected_tech):
+                            print(f"[{idx}/{len(active_truck_cfgs)}] ⏭️ '{truck_name}' is turned OFF in Dashboard. Skipping.")
                             continue
 
-                        expected_tech = self.get_expected_tech_for_truck(truck_name)
+                        # Find matching board WO(s) for this truck (any tech)
+                        board_rows = board_truck_map.get(c_truck_name, [])
+                        if not board_rows and nums_cfg:
+                            board_rows = board_truck_map.get(nums_cfg[0], [])
+                        # Deduplicate
+                        seen_wos = set()
+                        board_rows_dedup = []
+                        for br in board_rows:
+                            w = str(br.get("work_order_number", ""))
+                            if w not in seen_wos:
+                                seen_wos.add(w)
+                                board_rows_dedup.append(br)
+                        board_rows = board_rows_dedup
 
-                        if not expected_tech:
-                            print(f"[{idx}/{len(truck_headers)}] Truck '{truck_name}' is inactive or has no expected tech in Dashboard config. Skipping.")
+                        is_s4_tech = expected_tech.lower() in ("s4", "s3", "")
+
+                        if not board_rows:
+                            print(f"[{idx}/{len(active_truck_cfgs)}] ⚠️ No board WO found for '{truck_name}' (expected tech '{expected_tech}'). Skipping — will be created by header stage.")
                             continue
 
-                        if wo_num:
-                            if curr_tech_table and expected_tech and self.is_tech_match(curr_tech_table, expected_tech):
-                                print(f"[{idx}/{len(truck_headers)}] ✅ Truck '{truck_name}' (WO #{wo_num}) is ALREADY assigned to '{curr_tech_table}' (matches '{expected_tech}'). Skipping sidepanel.")
+                        # Find the best matching WO: prefer one on expected tech
+                        board_r = next((br for br in board_rows if self.is_tech_match(br.get("tech_name",""), expected_tech)), None)
+                        if not board_r:
+                            # If this truck is in service_needed_assets, do NOT steal an s4 Service Needed tracking WO!
+                            is_sn_truck = (c_truck_name in sn_names or (nums_cfg and nums_cfg[0] in sn_nums))
+                            candidate_board_rows = [
+                                br for br in board_rows
+                                if not (
+                                    (br.get("tech_name", "").strip().lower() in ("s4", "s3", "")) and
+                                    ("SERVICE NEEDED" in (br.get("priority_name") or "").upper() or "7.12" in (br.get("priority_name") or ""))
+                                )
+                            ] if is_sn_truck else board_rows
+
+                            if candidate_board_rows:
+                                board_r = candidate_board_rows[0]  # fallback: any WO for this truck (except s4 SN tracking)
+                            else:
+                                print(f"[{idx}/{len(active_truck_cfgs)}] ⚠️ No available truck WO found for '{truck_name}' (expected tech '{expected_tech}', s4 tracking WO preserved). Skipping — will be created by header stage.")
                                 continue
 
-                            expected_tech_already_has_it = False
-                            for other_r in truck_headers:
-                                if other_r.get("work_order_number") != wo_num:
-                                    other_truck = self.canonical_str(other_r.get("name", ""))
-                                    other_tech = other_r.get("tech_name", "")
-                                    if other_truck == self.canonical_str(truck_name) and self.is_tech_match(other_tech, expected_tech):
-                                        expected_tech_already_has_it = True
-                                        break
+                        wo_num         = board_r.get("work_order_number")
+                        curr_tech_table = board_r.get("tech_name", "")
+                        curr_sched     = board_r.get("scheduled_date", "")
+                        curr_prio      = board_r.get("priority_name", "")
+                        is_completed   = board_r.get("is_completed", False)
 
-                            if expected_tech_already_has_it:
-                                print(f"[{idx}/{len(truck_headers)}] ℹ️ Truck '{truck_name}' (WO #{wo_num}) is on '{curr_tech_table}', but expected tech '{expected_tech}' ALREADY has '{truck_name}'. Initiating cancellation of duplicate WO...")
-                                if click_wos and wo_num:
-                                    success = await self.cancel_work_order_via_list(
-                                        wo_number=wo_num,
-                                        reason=f"Duplicate truck '{truck_name}' on '{curr_tech_table}' (expected tech '{expected_tech}' already has it)."
-                                    )
-                                    if success:
-                                        print(f"[{idx}/{len(truck_headers)}] 🗑️ Cancelled duplicate truck WO #{wo_num} ({truck_name}) on '{curr_tech_table}'.")
-                                        total_reconciled += 1
-                                        continue
-                                    else:
-                                        print(f"[{idx}/{len(truck_headers)}] ⚠️ Could not cancel duplicate WO #{wo_num}. Preserving.")
-                                        continue
-                                else:
-                                    continue
+                        if is_completed:
+                            print(f"[{idx}/{len(active_truck_cfgs)}] ⏭️ WO #{wo_num} ('{truck_name}') is completed. Skipping.")
+                            json_covered_wos.add(str(wo_num))
+                            continue
 
+                        json_covered_wos.add(str(wo_num))
+
+                        # Preserve special priorities only when the board WO has OOS/Service Needed
+                        # AND the template does NOT define a different target priority for this truck.
+                        # If the template has a real priority (e.g. "[5] PT (Asset Assignment)"), always correct.
+                        curr_prio_upper = curr_prio.upper()
+                        has_special_priority = (
+                            (
+                                "OUT OF SERVICE"  in curr_prio_upper or
+                                "DO NOT DISPATCH" in curr_prio_upper or
+                                "SERVICE NEEDED"  in curr_prio_upper or
+                                "7.12"            in curr_prio
+                            ) and
+                            # Only preserve if the template target priority matches the current special one
+                            # (i.e. the template intentionally set this truck as OOS/SN/DND).
+                            # If the template says a normal truck priority, do NOT preserve the wrong special priority.
+                            (not target_priority or self.is_priority_match(curr_prio, target_priority))
+                        )
+                        effective_priority = curr_prio if has_special_priority else target_priority
+
+                        is_tech_set = bool(curr_tech_table and expected_tech and self.is_tech_match(curr_tech_table, expected_tech))
+                        is_time_set = not target_time or self.is_time_matching(target_time, curr_sched)
+                        is_prio_set = has_special_priority or not effective_priority or self.is_priority_match(curr_prio, effective_priority)
+
+                        if is_s4_tech:
+                            # s4 — only care about time
+                            if is_tech_set and is_time_set:
+                                print(f"[{idx}/{len(active_truck_cfgs)}] ✅ '{truck_name}' (WO #{wo_num}) s4 — time OK ('{curr_sched}'). Skipping.")
+                                continue
+                            if is_tech_set and not is_time_set:
+                                prio_note = f"keeping '{curr_prio}'" if has_special_priority else "no priority update"
+                                print(f"[{idx}/{len(active_truck_cfgs)}] 🕒 s4 '{truck_name}' WO #{wo_num}: time mismatch ('{curr_sched}' → '{target_time}'). {prio_note}")
+                                total_checked += 1
+                                updated = await self.update_service_needed_work_order(
+                                    work_order_number=wo_num, asset_name=truck_name,
+                                    target_time=target_time, target_priority="",
+                                    service_note="", target_tech=expected_tech,
+                                    current_tech=curr_tech_table, current_sched=curr_sched,
+                                    current_priority=curr_prio,
+                                    stage_label="Truck Assignment Update (s4 time fix)"
+                                )
+                                if updated:
+                                    total_reconciled += 1
+                                continue
+                            # tech mismatch even for s4 — fall through to reassign
+
+                        if is_tech_set and is_time_set and is_prio_set:
+                            print(f"[{idx}/{len(active_truck_cfgs)}] ✅ '{truck_name}' (WO #{wo_num}) fully set (Tech:'{curr_tech_table}', Time:'{curr_sched}', Prio:'{curr_prio}'). Skipping.")
+                            continue
+
+                        if is_tech_set:
+                            # Right tech, wrong time or priority
+                            print(f"[{idx}/{len(active_truck_cfgs)}] 🕒 '{truck_name}' WO #{wo_num} on '{curr_tech_table}': time={not is_time_set} (→'{target_time}'), prio={not is_prio_set} (→'{effective_priority}')")
                             total_checked += 1
-                            print(f"\n[{idx}/{len(truck_headers)}] Checking WO #{wo_num} ({truck_name}) on {normalized_date} (Reassigning from '{curr_tech_table}' to expected '{expected_tech}')...")
-                            updated = await self.click_and_reconcile_work_order(
-                                work_order_number=wo_num,
-                                truck_name=truck_name,
-                                expected_tech=expected_tech
+                            updated = await self.update_service_needed_work_order(
+                                work_order_number=wo_num, asset_name=truck_name,
+                                target_time=target_time, target_priority=effective_priority,
+                                service_note="", target_tech=expected_tech,
+                                current_tech=curr_tech_table, current_sched=curr_sched,
+                                current_priority=curr_prio, stage_label="Truck Assignment Update"
                             )
                             if updated:
                                 total_reconciled += 1
+                            continue
+
+                        # Tech mismatch — check if expected tech already has this truck
+                        expected_tech_already_has_it = any(
+                            self.is_tech_match(other.get("tech_name", ""), expected_tech)
+                            and str(other.get("work_order_number")) != str(wo_num)
+                            and (self.canonical_str(other.get("name", "")) == c_truck_name or
+                                 (nums_cfg and re.findall(r'\d+', other.get("name","")) and
+                                  int(re.findall(r'\d+', other.get("name",""))[0]) == int(nums_cfg[0])))
+                            for other in truck_headers
+                        )
+
+                        if expected_tech_already_has_it:
+                            print(f"[{idx}/{len(active_truck_cfgs)}] ℹ️ '{truck_name}' (WO #{wo_num}) on '{curr_tech_table}', but '{expected_tech}' already has it. Cancelling duplicate...")
+                            if click_wos and wo_num:
+                                success = await self.cancel_work_order_via_list(wo_number=wo_num, reason=f"Duplicate '{truck_name}' on '{curr_tech_table}' ('{expected_tech}' already has it).")
+                                if success:
+                                    print(f"[{idx}/{len(active_truck_cfgs)}] 🗑️ Cancelled duplicate WO #{wo_num}.")
+                                    total_reconciled += 1
+                            continue
+
+                        # Reassign to correct tech
+                        total_checked += 1
+                        print(f"\n[{idx}/{len(active_truck_cfgs)}] 🔀 Reassigning '{truck_name}' WO #{wo_num} from '{curr_tech_table}' → '{expected_tech}'...")
+                        updated = await self.update_service_needed_work_order(
+                            work_order_number=wo_num, asset_name=truck_name,
+                            target_time=target_time, target_priority=target_priority,
+                            service_note="", target_tech=expected_tech,
+                            current_tech=curr_tech_table, current_sched=curr_sched,
+                            current_priority=curr_prio, stage_label="Truck Assignment Reassign"
+                        )
+                        if updated:
+                            total_reconciled += 1
+
+                    # --- Step C: Cancel board WOs not covered by any active JSON entry ---
+                    for r in truck_headers:
+                        wo_num = str(r.get("work_order_number", ""))
+                        if wo_num in json_covered_wos:
+                            continue
+                        t_name = r.get("name", "")
+                        t_tech = r.get("tech_name", "")
+                        if not (("🚛" in t_name or "🛻" in t_name) and wo_num):
+                            continue
+                        if r.get("is_completed", False):
+                            continue
+                        if self.is_item_turned_off_in_dashboard(t_name, t_tech):
+                            continue
+                        exp_tech = self.get_expected_tech_for_truck(t_name)
+                        if not exp_tech:
+                            print(f"⚠️ Board WO #{wo_num} ('{t_name}' on '{t_tech}') has no active JSON entry. Skipping (may be stale).")
             else:
                 print(f"⚠️ No truck_assign_headers found on {normalized_date}.")
 
