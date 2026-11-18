@@ -978,7 +978,7 @@ class DispatchBoardDisplayAutomationScraper(BaseScraper):
                 variants.append(right_clean)
         return variants
 
-    async def select_dropdown_option(self, dropdown_selector: str, option_text: str, press_enter: bool = True, allow_fuzzy: bool = True) -> bool:
+    async def select_dropdown_option(self, dropdown_selector: str, option_text: str, press_enter: bool = True) -> bool:
         if not option_text:
             return True
 
@@ -1008,204 +1008,239 @@ class DispatchBoardDisplayAutomationScraper(BaseScraper):
             name_variants = self.extract_name_variants(option_text)
             target_canons = set(self.canonical_str(v) for v in name_variants if self.canonical_str(v))
             target_norms = set(unicodedata.normalize('NFKD', v).strip().lower() for v in name_variants if v)
-            raw_target = str(option_text).strip()
-            target_canon = self.canonical_str(raw_target)
-            target_norm = unicodedata.normalize('NFKD', raw_target).strip().lower()
+            is_time_target = bool(re.search(r'\b\d{1,2}:\d{2}\b', option_text)) or any(w in ('am', 'pm') for w in re.findall(r'\b[a-zA-Z0-9]+\b', option_text.lower()))
 
             clean_search = unicodedata.normalize('NFKD', option_text).strip()
             clean_core = re.sub(r'^[a-zA-Z0-9]{1,3}\s+', '', clean_search).strip()
 
-            type_text = re.sub(r'^[\s\u2000-\u200f]+|[\s\u2000-\u200f]+$', '', raw_target).strip('\r\n')
-            
-            # Enter the FULL name from JSON as it is
-            await search_input.focus()
-            await search_input.fill("")
+            type_text = re.sub(r'^[\s\u2000-\u200f]+|[\s\u2000-\u200f]+$', '', str(option_text)).strip('\r\n')
             await search_input.fill(type_text)
-            try:
-                await search_input.evaluate("el => { el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); }")
-            except Exception:
-                pass
-            await self.page.wait_for_timeout(300)
+            await self.page.wait_for_timeout(250)
 
-            async def _get_option_text(opt_el):
-                try:
-                    raw_inner = await opt_el.inner_text()
-                except Exception:
-                    raw_inner = ""
-                raw_text = raw_inner if (raw_inner and raw_inner.strip()) else (await opt_el.text_content() or "")
-                if not raw_text:
-                    return "", ""
-                s_raw = raw_text.strip()
-                lines = [l.strip() for l in s_raw.splitlines() if l.strip()]
-                first_line = lines[0] if lines else ""
-                return s_raw, first_line
-
-            # Check if this dropdown is customer-select or searches on Enter
-            is_customer_select = False
-            is_search_on_enter = False
-            try:
-                is_customer_select = await dropdown.evaluate("""el => {
-                    return el.classList.contains('customer-select') ||
-                           el.classList.contains('employee-vue-select') ||
-                           (el.id && el.id.includes('customer')) ||
-                           el.getAttribute('search-on-enter') === 'true' ||
-                           (el.querySelector && el.querySelector('.customer-select') !== null);
-                }""")
-                is_search_on_enter = is_customer_select or await dropdown.evaluate("""el => {
-                    return el.getAttribute('search-on-enter') === 'true' ||
-                           el.classList.contains('customer-select') ||
-                           el.getAttribute('search-on-enter') === true;
-                }""")
-            except Exception:
-                pass
-
-            if is_search_on_enter or is_customer_select:
+            if press_enter:
                 await search_input.press("Enter")
-                try:
-                    spinner = self.page.locator(".vs__spinner:visible, .customer-select .vs__spinner:visible, #vscreate-wo-customer-select .vs__spinner:visible")
-                    if await spinner.count() > 0:
-                        await spinner.first.wait_for(state="hidden", timeout=4000)
-                except Exception:
-                    pass
                 await self.page.wait_for_timeout(350)
 
-            options = self.page.locator("#vscreate-wo-customer-select__listbox li, .customer-select ul[role='listbox'] li, .customer-select li.vs__dropdown-option, ul.vs__dropdown-menu:visible li, ul[role='listbox']:visible li, li.vs__dropdown-option:visible, li.vs__dropdown-option")
+                selected_check = dropdown.locator(".vs__selected, .selected-tag").first
+                if await selected_check.count() > 0 and (await selected_check.text_content() or "").strip():
+                    sel_text = (await selected_check.text_content() or "").strip()
+                    c_sel = self.canonical_str(sel_text)
+                    c_target = self.canonical_str(option_text)
+                    t_words = set(re.findall(r'\b[a-zA-Z0-9]+\b', option_text.lower()))
+                    s_words = set(re.findall(r'\b[a-zA-Z0-9]+\b', sel_text.lower()))
+                    qualifier_conflict = is_time_target and ((('am' in t_words) != ('am' in s_words)) or (('pm' in t_words) != ('pm' in s_words)))
+                    sel_has_banner = self.has_banner_prefix(sel_text)
+                    banner_conflict = (target_has_banner != sel_has_banner)
+
+                    if not qualifier_conflict and not banner_conflict and (c_sel in target_canons or c_sel == c_target or self.is_tech_match(sel_text, option_text)):
+                        print(f"  -> Selected '{sel_text}' via Enter directly.")
+                        return True
+                    else:
+                        conflict_desc = "banner/emoji conflict" if banner_conflict else ("time qualifier conflict" if qualifier_conflict else "non-matching option")
+                        print(f"  -> Enter selected '{sel_text}' ({conflict_desc} for '{option_text}': target_banner={target_has_banner}, sel_banner={sel_has_banner}). Clearing to pick exact match from dropdown menu...")
+                        clear_btn = dropdown.locator(".vs__clear, button.close").first
+                        if await clear_btn.count() > 0 and await clear_btn.is_visible():
+                            await clear_btn.click(force=True)
+                        else:
+                            await search_input.click(force=True)
+                        await self.page.wait_for_timeout(200)
+
+                try:
+                    dyn_opts = self.page.locator("ul.vs__dropdown-menu:visible li, ul[role='listbox']:visible li, li.vs__dropdown-option:visible")
+                    await dyn_opts.first.wait_for(state="visible", timeout=1200)
+                except Exception:
+                    await self.page.wait_for_timeout(300)
+
+            options = self.page.locator("ul.vs__dropdown-menu:visible li, ul[role='listbox']:visible li, li.vs__dropdown-option:visible")
             try:
-                await options.first.wait_for(state="visible", timeout=3000)
+                await options.first.wait_for(state="visible", timeout=6000)
             except Exception:
                 pass
 
-            # If no options appeared yet with fill, try typing with keyboard to trigger search
-            if (await options.count()) == 0:
-                try:
-                    await search_input.click(force=True)
-                    await self.page.keyboard.press("Control+A")
-                    await self.page.keyboard.press("Backspace")
-                    await search_input.type(type_text, delay=20)
-                    if is_search_on_enter or is_customer_select:
-                        await search_input.press("Enter")
-                    await self.page.wait_for_timeout(400)
-                    await options.first.wait_for(state="visible", timeout=3000)
-                except Exception:
-                    pass
-
-            # If still 0 options and text has emoji, try querying without emoji to let dropdown populate,
-            # BUT WE WILL STILL ONLY CLICK / MATCH THE FULL NAME FROM JSON!
-            if (await options.count()) == 0:
-                no_emoji = re.sub(r'[\u203C-\u3299\U0001F000-\U0001FAFF\ufe0f\u200d]', '', type_text).strip()
-                clean_no_emoji = re.sub(r'^[|#\-_\s\u2000-\u200f]+|[|#\-_\s\u2000-\u200f]+$', '', no_emoji).strip()
-                if clean_no_emoji and clean_no_emoji != type_text:
+            if press_enter:
+                for _retry in range(2):
+                    if await options.count() > 0:
+                        break
+                    print(f"  -> Customer search: no results yet, retrying ({_retry + 1}/2)...")
+                    await search_input.press("Enter")
+                    await self.page.wait_for_timeout(1200)
                     try:
-                        await search_input.focus()
-                        await search_input.fill("")
-                        await search_input.fill(clean_no_emoji)
-                        await search_input.evaluate("el => el.dispatchEvent(new Event('input', { bubbles: true }))")
-                        if is_search_on_enter or is_customer_select:
-                            await search_input.press("Enter")
-                        await self.page.wait_for_timeout(400)
-                        await options.first.wait_for(state="visible", timeout=3000)
+                        await options.first.wait_for(state="visible", timeout=4000)
                     except Exception:
                         pass
 
-            # If still 0 options, try text after pipe strictly for populating options
-            if (await options.count()) == 0 and "|" in type_text:
-                right_side = type_text.split("|")[-1].strip()
-                right_clean = re.sub(r'[\u203C-\u3299\U0001F000-\U0001FAFF\ufe0f\u200d\u2000-\u200f]', '', right_side).strip()
-                if right_clean and right_clean != type_text:
-                    try:
-                        await search_input.focus()
-                        await search_input.fill("")
-                        await search_input.fill(right_clean)
-                        await search_input.evaluate("el => el.dispatchEvent(new Event('input', { bubbles: true }))")
-                        if is_search_on_enter or is_customer_select:
+                # Fallback: If searching with full name (or emoji) yielded 0 options, retry with clean emoji-free variants
+                if (await options.count()) == 0 and len(name_variants) > 1:
+                    for fallback_var in name_variants[1:]:
+                        if (await options.count()) > 0:
+                            break
+                        print(f"  -> No options found for '{clean_search}'. Retrying customer search without emoji using '{fallback_var}'...")
+                        try:
+                            await search_input.focus()
+                            await search_input.fill("")
+                            await search_input.fill(fallback_var)
+                            await self.page.wait_for_timeout(200)
                             await search_input.press("Enter")
-                        await self.page.wait_for_timeout(400)
-                        await options.first.wait_for(state="visible", timeout=3000)
-                    except Exception:
-                        pass
+                            await self.page.wait_for_timeout(1200)
+                            try:
+                                await options.first.wait_for(state="visible", timeout=5000)
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
+
+                if (await options.count()) == 0:
+                    m_dig = re.search(r'\b\d{2,4}\b', clean_search)
+                    if m_dig and m_dig.group(0) != clean_search:
+                        fallback_term = m_dig.group(0)
+                        print(f"  -> No options found for '{clean_search}'. Retrying customer search with clean truck number '{fallback_term}'...")
+                        try:
+                            await search_input.focus()
+                            await search_input.fill("")
+                            await search_input.fill(fallback_term)
+                            await self.page.wait_for_timeout(200)
+                            await search_input.press("Enter")
+                            await self.page.wait_for_timeout(1200)
+                            try:
+                                await options.first.wait_for(state="visible", timeout=5000)
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
+
+                if (await options.count()) == 0:
+                    words = re.findall(r'[a-zA-Z]{3,}', option_text)
+                    keyword_fallback = max(words, key=len) if words else ""
+                    if keyword_fallback and keyword_fallback.upper() != option_text.upper():
+                        print(f"  -> No options found for '{clean_search}'. Retrying customer search with keyword: '{keyword_fallback}'...")
+                        try:
+                            await search_input.focus()
+                            await search_input.fill("")
+                            await search_input.fill(keyword_fallback)
+                            await self.page.wait_for_timeout(200)
+                            await search_input.press("Enter")
+                            await self.page.wait_for_timeout(1200)
+                            try:
+                                await options.first.wait_for(state="visible", timeout=5000)
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
+            else:
+                if (await options.count()) == 0:
+                    if clean_core and clean_core != option_text:
+                        try:
+                            await search_input.focus()
+                            await search_input.fill("")
+                            await search_input.fill(clean_core)
+                            await self.page.wait_for_timeout(250)
+                            try:
+                                await options.first.wait_for(state="visible", timeout=2000)
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
+                    if (await options.count()) == 0 and len(name_variants) > 1:
+                        for fallback_var in name_variants[1:]:
+                            if (await options.count()) > 0:
+                                break
+                            try:
+                                await search_input.focus()
+                                await search_input.fill("")
+                                await search_input.fill(fallback_var)
+                                await self.page.wait_for_timeout(250)
+                                try:
+                                    await options.first.wait_for(state="visible", timeout=3000)
+                                except Exception:
+                                    pass
+                            except Exception:
+                                pass
 
             count = await options.count()
             clicked = False
             raw_target = option_text.strip()
             target_norm = clean_search.lower()
             target_canon = self.canonical_str(option_text)
+            m_core = re.sub(r'^[a-z0-9]\s*', '', target_norm)
+            core_name = m_core if len(m_core) >= 3 else target_norm
 
-            async def _exact_match_option(opt_el) -> bool:
+            async def _exact_match_option(opt_el, strict_banner: bool = True) -> bool:
                 if not await opt_el.is_visible():
                     return False
-                s_raw, first_line = await _get_option_text(opt_el)
-                if not s_raw or not first_line:
+                raw_text = await opt_el.text_content()
+                if not raw_text:
                     return False
+                s_raw = raw_text.strip()
+                first_line = [l.strip() for l in s_raw.splitlines() if l.strip()][0] if s_raw else ""
                 norm_first = unicodedata.normalize('NFKD', first_line).strip().lower()
                 c_first = self.canonical_str(first_line)
-                if self._has_qualifier_conflict(raw_target, first_line):
-                    return False
-                if not is_customer_select and (self.has_banner_prefix(first_line) != target_has_banner):
-                    return False
-                norm_raw = unicodedata.normalize('NFKD', s_raw).strip().lower()
                 c_raw = self.canonical_str(s_raw)
-                exact_text = (
+
+                if is_time_target:
+                    t_words = set(re.findall(r'\b[a-zA-Z0-9]+\b', raw_target.lower()))
+                    o_words = set(re.findall(r'\b[a-zA-Z0-9]+\b', s_raw.lower()))
+                    if ('am' in t_words) != ('am' in o_words) or ('pm' in t_words) != ('pm' in o_words):
+                        return False
+
+                if strict_banner and (self.has_banner_prefix(s_raw) != target_has_banner):
+                    return False
+
+                if (
                     s_raw == raw_target or
-                    first_line == raw_target or
-                    s_raw.strip().lower() == raw_target.lower() or
-                    first_line.strip().lower() == raw_target.lower() or
-                    norm_first == target_norm or
-                    norm_raw == target_norm or
                     first_line in name_variants or
                     s_raw in name_variants or
+                    norm_first == target_norm or
                     norm_first in target_norms or
-                    norm_raw in target_norms
-                )
-                canon_eq = (
                     c_first == target_canon or
                     c_raw == target_canon or
                     c_first in target_canons or
                     c_raw in target_canons
-                )
-                if exact_text or canon_eq:
+                ):
                     await opt_el.scroll_into_view_if_needed()
                     await opt_el.click(force=True)
-                    try:
-                        await opt_el.dispatchEvent("mousedown")
-                        await opt_el.dispatchEvent("click")
-                    except Exception:
-                        pass
-                    if not is_customer_select and (press_enter or is_search_on_enter):
-                        await self.page.wait_for_timeout(100)
-                        try:
-                            await search_input.press("Enter")
-                        except Exception:
-                            pass
                     return True
                 return False
 
-            async def _fuzzy_match_option(opt_el) -> bool:
-                if not allow_fuzzy or not await opt_el.is_visible():
+            async def _fuzzy_match_option(opt_el, strict_banner: bool = True) -> bool:
+                if not await opt_el.is_visible():
                     return False
-                s_raw, first_line = await _get_option_text(opt_el)
-                if not s_raw or not first_line or s_raw == raw_target:
+                raw_text = await opt_el.text_content()
+                if not raw_text:
                     return False
+                s_raw = raw_text.strip()
+                if s_raw == raw_target:
+                    return False
+                first_line = [l.strip() for l in s_raw.splitlines() if l.strip()][0] if s_raw else ""
                 norm_raw = unicodedata.normalize('NFKD', s_raw).strip().lower()
                 norm_first = unicodedata.normalize('NFKD', first_line).strip().lower()
                 c_raw = self.canonical_str(s_raw)
                 c_first = self.canonical_str(first_line)
 
-                if self._has_qualifier_conflict(raw_target, first_line):
-                    return False
-                if not is_customer_select and (self.has_banner_prefix(first_line) != target_has_banner):
+                if is_time_target:
+                    t_words = set(re.findall(r'\b[a-zA-Z0-9]+\b', raw_target.lower()))
+                    o_words = set(re.findall(r'\b[a-zA-Z0-9]+\b', s_raw.lower()))
+                    if ('am' in t_words) != ('am' in o_words) or ('pm' in t_words) != ('pm' in o_words):
+                        return False
+
+                if strict_banner and (self.has_banner_prefix(s_raw) != target_has_banner):
                     return False
 
-                if norm_raw == target_norm or norm_first == target_norm or (clean_core and (norm_raw == clean_core.lower() or norm_first == clean_core.lower())):
+                if norm_raw == target_norm or norm_raw == clean_core.lower() or norm_first in target_norms:
                     await opt_el.scroll_into_view_if_needed()
                     await opt_el.click(force=True)
                     return True
 
-                if target_canon and (target_canon == c_raw or target_canon == c_first or (clean_core and self.canonical_str(clean_core) in (c_raw, c_first))):
+                if (c_first and c_first in target_canons) or (c_raw and c_raw in target_canons):
                     await opt_el.scroll_into_view_if_needed()
                     await opt_el.click(force=True)
                     return True
 
-                if self.is_tech_match(s_raw, option_text) or self.is_tech_match(s_raw, clean_search):
+                if target_canon and (target_canon == c_raw or target_canon == c_first or self.canonical_str(clean_core) in (c_raw, c_first)):
+                    await opt_el.scroll_into_view_if_needed()
+                    await opt_el.click(force=True)
+                    return True
+
+                if self.is_tech_match(s_raw, option_text) or self.is_tech_match(s_raw, clean_search) or any(self.is_tech_match(s_raw, v) for v in name_variants):
                     await opt_el.scroll_into_view_if_needed()
                     await opt_el.click(force=True)
                     return True
@@ -1225,12 +1260,6 @@ class DispatchBoardDisplayAutomationScraper(BaseScraper):
                 if is_target_serv and is_raw_pump:
                     return False
 
-                # Prevent decimal code conflicts (e.g. 7.1 vs 7.12)
-                m_t_code = re.findall(r'\b\d+\.\d+\b', raw_target)
-                m_r_code = re.findall(r'\b\d+\.\d+\b', s_raw)
-                if m_t_code and m_r_code and m_t_code != m_r_code:
-                    return False
-
                 t_words = set(re.findall(r'\b[a-zA-Z0-9]+\b', raw_target.lower()))
                 if len(target_norm) >= 4 and len(norm_raw) >= 4 and not any(w in ('shop', 'am', 'pm') for w in t_words):
                     if target_norm in norm_raw or norm_raw in target_norm:
@@ -1243,10 +1272,9 @@ class DispatchBoardDisplayAutomationScraper(BaseScraper):
                     after_pipe_raw = s_raw.split("|")[-1].strip() if "|" in s_raw else s_raw.strip()
                     if re.match(r'^\d{2,4}$', after_pipe_target) and re.match(r'^\d{2,4}$', after_pipe_raw):
                         if int(after_pipe_target) == int(after_pipe_raw):
-                            if self.has_banner_prefix(s_raw) == target_has_banner:
-                                await opt_el.scroll_into_view_if_needed()
-                                await opt_el.click(force=True)
-                                return True
+                            await opt_el.scroll_into_view_if_needed()
+                            await opt_el.click(force=True)
+                            return True
 
                 return False
 
@@ -1256,35 +1284,10 @@ class DispatchBoardDisplayAutomationScraper(BaseScraper):
                         return True
                 return False
 
-            clicked = await _scan_options(_exact_match_option, count)
-            if not clicked and allow_fuzzy:
-                clicked = await _scan_options(_fuzzy_match_option, count)
-
-            # If customer dropdown had no match with initial full query (e.g. because of emoji), retry search without emoji
-            if not clicked and is_customer_select:
-                clean_target = re.sub(r'[\u203C-\u3299\U0001F000-\U0001FAFF\ufe0f\u200d]', '', raw_target).strip()
-                clean_target = re.sub(r'^[|#\-_\s\u2000-\u200f]+|[|#\-_\s\u2000-\u200f]+$', '', clean_target).strip()
-                if clean_target and clean_target != type_text:
-                    print(f"  -> No exact match for '{raw_target}' in initial customer search. Retrying search with clean query: '{clean_target}'...")
-                    try:
-                        await search_input.focus()
-                        await search_input.fill("")
-                        await search_input.fill(clean_target)
-                        await search_input.evaluate("el => el.dispatchEvent(new Event('input', { bubbles: true }))")
-                        await search_input.press("Enter")
-                        try:
-                            spinner = self.page.locator(".vs__spinner:visible, .customer-select .vs__spinner:visible, #vscreate-wo-customer-select .vs__spinner:visible")
-                            if await spinner.count() > 0:
-                                await spinner.first.wait_for(state="hidden", timeout=4000)
-                        except Exception:
-                            pass
-                        await self.page.wait_for_timeout(500)
-                        count_retry = await options.count()
-                        clicked = await _scan_options(_exact_match_option, count_retry)
-                        if not clicked and allow_fuzzy:
-                            clicked = await _scan_options(_fuzzy_match_option, count_retry)
-                    except Exception:
-                        pass
+            # Strict banner/emoji matching (exact, then fuzzy). Lenient fallback is strictly disabled to prevent emoji/plain mismatch.
+            clicked = await _scan_options(lambda opt: _exact_match_option(opt, strict_banner=True), count)
+            if not clicked:
+                clicked = await _scan_options(lambda opt: _fuzzy_match_option(opt, strict_banner=True), count)
 
             if not clicked and count > 0:
                 try:
@@ -1294,99 +1297,39 @@ class DispatchBoardDisplayAutomationScraper(BaseScraper):
                             await self.page.evaluate("""(menu) => { if (menu) menu.scrollTop += 300; }""", await menu_container.element_handle())
                             await self.page.wait_for_timeout(150)
                             count_now = await options.count()
-                            clicked = await _scan_options(_exact_match_option, count_now)
-                            if not clicked and allow_fuzzy:
-                                clicked = await _scan_options(_fuzzy_match_option, count_now)
+                            clicked = await _scan_options(lambda opt: _exact_match_option(opt, strict_banner=True), count_now)
+                            if not clicked:
+                                clicked = await _scan_options(lambda opt: _fuzzy_match_option(opt, strict_banner=True), count_now)
                             if clicked:
                                 break
                 except Exception:
                     pass
 
             if not clicked:
-                # 1) Check if the dropdown already has the target option selected (e.g. Enter on search selected it directly)
-                check_val = ""
-                selected_check = dropdown.locator(".vs__selected, .selected-tag, .vs__selected-options").first
-                if await selected_check.count() > 0 and await selected_check.is_visible():
-                    check_val = (await selected_check.text_content() or "").strip()
-                if not check_val:
-                    try:
-                        check_val = (await search_input.input_value() or "").strip()
-                    except Exception:
-                        pass
-                if check_val:
-                    c_chk = self.canonical_str(check_val)
-                    if (
-                        check_val == raw_target or
-                        check_val.strip().lower() == raw_target.lower() or
-                        c_chk == target_canon or
-                        c_chk in target_canons or
-                        check_val in name_variants
-                    ):
-                        print(f"  -> Option '{check_val}' is already selected in dropdown.")
-                        clicked = True
-
-            if not clicked:
-                if (press_enter or is_search_on_enter) and not is_customer_select:
+                if press_enter:
                     selected_check = dropdown.locator(".vs__selected, .selected-tag").first
                     if await selected_check.count() > 0 and await selected_check.is_visible():
                         sel_val = (await selected_check.text_content() or "").strip()
                         c_sel = self.canonical_str(sel_val)
-                        banner_ok = True if is_customer_select else (self.has_banner_prefix(sel_val) == target_has_banner)
-                        qual_ok = not self._has_qualifier_conflict(raw_target, sel_val)
-                        val_ok = (
-                            sel_val.strip().lower() == raw_target.lower() or
-                            (c_sel == target_canon and banner_ok) or
-                            (is_customer_select and (target_canon in c_sel or c_sel in target_canon)) or
-                            (allow_fuzzy and self.is_tech_match(sel_val, option_text))
-                        )
-                        if banner_ok and qual_ok and val_ok:
+                        t_words = set(re.findall(r'\b[a-zA-Z0-9]+\b', raw_target.lower()))
+                        s_words = set(re.findall(r'\b[a-zA-Z0-9]+\b', sel_val.lower()))
+                        banner_ok = (self.has_banner_prefix(sel_val) == target_has_banner)
+                        if banner_ok and (('am' in t_words) == ('am' in s_words) and ('pm' in t_words) == ('pm' in s_words)) and (c_sel == target_canon or self.is_tech_match(sel_val, option_text)):
                             return True
-
-                    # Check if an option is currently highlighted in the open dropdown (as shown in UI)
-                    highlighted_opt = dropdown.locator("li.vs__dropdown-option--highlight, ul[role='listbox'] li.vs__dropdown-option--highlight, ul.vs__dropdown-menu li:first-child").first
-                    if await highlighted_opt.count() > 0 and await highlighted_opt.is_visible():
-                        h_raw, h_first = await _get_option_text(highlighted_opt)
-                        c_h = self.canonical_str(h_first or h_raw)
-                        if (h_first == raw_target or h_raw == raw_target or c_h == target_canon or h_first.strip().lower() == raw_target.lower()):
-                            await highlighted_opt.click(force=True)
-                            await self.page.wait_for_timeout(350)
-                            if await selected_check.count() > 0 and await selected_check.is_visible():
-                                return True
-
                     if await options.count() > 0:
                         for idx_opt in range(await options.count()):
                             opt_cand = options.nth(idx_opt)
-                            if await _exact_match_option(opt_cand):
-                                return True
-                            if allow_fuzzy and await _fuzzy_match_option(opt_cand):
-                                return True
-
-                    # Press Enter on input to confirm/select the option
-                    cur_in = (await search_input.input_value() or "").strip()
-                    if cur_in == raw_target or cur_in.lower() == raw_target.lower() or is_search_on_enter:
-                        await search_input.press("Enter")
-                        await self.page.wait_for_timeout(350)
-
-                        options_after = dropdown.locator("ul.vs__dropdown-menu:visible li, ul[role='listbox']:visible li, li.vs__dropdown-option:visible")
-                        if await options_after.count() > 0:
-                            for idx_opt in range(await options_after.count()):
-                                opt_cand = options_after.nth(idx_opt)
-                                if await _exact_match_option(opt_cand):
+                            if await opt_cand.is_visible():
+                                f_raw = (await opt_cand.text_content() or "").strip()
+                                t_words = set(re.findall(r'\b[a-zA-Z0-9]+\b', raw_target.lower()))
+                                f_words = set(re.findall(r'\b[a-zA-Z0-9]+\b', f_raw.lower()))
+                                time_ok = not is_time_target or ((('am' in t_words) == ('am' in f_words)) and (('pm' in t_words) == ('pm' in f_words)))
+                                banner_ok = (self.has_banner_prefix(f_raw) == target_has_banner)
+                                c_f = self.canonical_str(f_raw)
+                                if time_ok and banner_ok and (c_f in target_canons or c_f == target_canon or self.is_tech_match(f_raw, option_text)):
+                                    await opt_cand.click(force=True)
                                     return True
-                            await search_input.press("Enter")
-                            await self.page.wait_for_timeout(350)
-
-                        if await selected_check.count() > 0 and await selected_check.is_visible():
-                            sel_val = (await selected_check.text_content() or "").strip()
-                            banner_ok = True if is_customer_select else (self.has_banner_prefix(sel_val) == target_has_banner)
-                            val_ok = (
-                                sel_val.strip().lower() == raw_target.lower() or
-                                (self.canonical_str(sel_val) == target_canon and banner_ok) or
-                                (is_customer_select and (target_canon in self.canonical_str(sel_val) or self.canonical_str(sel_val) in target_canon))
-                            )
-                            if banner_ok and val_ok:
-                                return True
-                    print(f"  -> Dropdown selection: No valid full match selected for '{option_text}'. Aborting to prevent misassignment.")
+                    print(f"  -> Press-Enter fallback: No valid option was selected for '{option_text}'. Aborting to prevent misassignment.")
                     return False
                 else:
                     print(f"⚠️ Could not find exact or canonical match for option '{option_text}' in dropdown ({dropdown_selector}). Aborting selection to prevent misassignment.")
@@ -1401,27 +1344,22 @@ class DispatchBoardDisplayAutomationScraper(BaseScraper):
                 selected_el = dropdown.locator(".vs__selected, .selected-tag, .vs__selected-options").first
                 if await selected_el.count() > 0:
                     selected_val = (await selected_el.text_content() or "").strip()
-                if not selected_val:
-                    try:
-                        selected_val = (await search_input.input_value() or "").strip()
-                    except Exception:
-                        pass
-                if selected_val:
                     clean_sel = self.canonical_str(selected_val)
                     clean_opt = self.canonical_str(option_text)
-                    qualifier_conflict = self._has_qualifier_conflict(option_text, selected_val)
+                    t_words = set(re.findall(r'\b[a-zA-Z0-9]+\b', option_text.lower()))
+                    s_words = set(re.findall(r'\b[a-zA-Z0-9]+\b', selected_val.lower()))
+                    qualifier_conflict = is_time_target and ((('am' in t_words) != ('am' in s_words)) or (('pm' in t_words) != ('pm' in s_words)))
                     sel_has_banner = self.has_banner_prefix(selected_val)
-                    banner_conflict = False if is_customer_select else (target_has_banner != sel_has_banner)
-                    exact_or_canon = (
-                        selected_val == raw_target or
-                        selected_val.strip().lower() == raw_target.lower() or
-                        selected_val in name_variants or
+                    banner_conflict = (target_has_banner != sel_has_banner)
+                    if not qualifier_conflict and not banner_conflict and (
+                        selected_val == option_text or
                         clean_sel == clean_opt or
                         clean_sel in target_canons or
-                        (clean_sel == clean_opt and not banner_conflict)
-                    )
-                    fuzzy_ok = allow_fuzzy and self.is_tech_match(selected_val, option_text)
-                    if (is_customer_select and exact_or_canon) or (not qualifier_conflict and not banner_conflict and (exact_or_canon or fuzzy_ok)):
+                        selected_val.strip() in name_variants or
+                        any(v.lower() == selected_val.strip().lower() for v in name_variants) or
+                        selected_val.strip().lower() == option_text.strip().lower() or
+                        self.is_tech_match(selected_val, option_text)
+                    ):
                         is_verified = True
                         break
                 await self.page.wait_for_timeout(150)
@@ -1463,7 +1401,7 @@ class DispatchBoardDisplayAutomationScraper(BaseScraper):
 
             print(f"  [1/7] Customer: '{customer_name}'")
             customer_xpath = self.rules.get('dispatch_board_customer_xpath', "//div[@class[contains(.,'field-title')] and contains(normalize-space(),'Customer Name')]/following::div[contains(@class,'v-select')][1]")
-            success = await self.select_dropdown_option(customer_xpath, customer_name, press_enter=True, allow_fuzzy=False)
+            success = await self.select_dropdown_option(customer_xpath, customer_name, press_enter=True)
             if not success:
                 print(f"⚠️ Failed to select Customer '{customer_name}'. Aborting.")
                 return False
@@ -1734,7 +1672,6 @@ class DispatchBoardDisplayAutomationScraper(BaseScraper):
                     c_tc = self.canonical_str(customer_name)
                     cust_ok = (
                         not self._has_qualifier_conflict(customer_name, final_cust) and
-                        (self.has_banner_prefix(final_cust) == self.has_banner_prefix(customer_name)) and
                         (
                             final_cust == customer_name or
                             final_cust.lower() == customer_name.strip().lower() or
