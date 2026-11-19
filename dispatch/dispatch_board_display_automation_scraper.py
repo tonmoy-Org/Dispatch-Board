@@ -4,13 +4,21 @@ import json
 import re
 import asyncio
 import random
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as datetime_time
+from zoneinfo import ZoneInfo
+try:
+    PACIFIC_TZ = ZoneInfo("America/Los_Angeles")
+except Exception:
+    import pytz
+    PACIFIC_TZ = pytz.timezone("America/Los_Angeles")
+
+DUMMY_HEADER_TECHS = ("s3", "s4", "s6", "s7", "t9", "t91", "f2", "p2")
 import time
 import traceback
 import urllib.request
 import urllib.error
 import unicodedata
-from typing import List, Dict, Optional, Callable
+from typing import List, Dict, Optional, Callable, Tuple, Any
 
 if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8')
@@ -21,13 +29,22 @@ _dispatch_dir = os.path.dirname(os.path.abspath(__file__))
 if _dispatch_dir not in sys.path:
     sys.path.insert(0, _dispatch_dir)
 
-from base_scraper import BaseScraper
+try:
+    from base_scraper import BaseScraper
+except ImportError:
+    try:
+        from automation.scrapers.base_scraper import BaseScraper  # type: ignore
+    except ImportError:
+        from dispatch.base_scraper import BaseScraper  # type: ignore
+
 
 class DispatchBoardDisplayAutomationScraper(BaseScraper):
 
     def __init__(self, template_path: Optional[str] = None):
         super().__init__()
         self.scraper_name = "dispatch-board-display-automation"
+        self.intercepted_board_by_date: Dict[str, Any] = {}
+        self.board_req: Dict[str, Any] = {}
         if template_path:
             self.template_path = template_path
         else:
@@ -162,7 +179,7 @@ class DispatchBoardDisplayAutomationScraper(BaseScraper):
             canon_target = self.canonical_str(name)
             is_service_wo = bool(
                 header.get('is_service_needed_duplicate') or
-                ('SERVICE NEEDED' in str(header.get('priority', '')) or '7.12' in str(header.get('priority', '')))
+                (header.get('service_note') and ('SERVICE NEEDED' in str(header.get('priority', '')) or '7.12' in str(header.get('priority', ''))))
             )
             is_oos_wo = bool(
                 header.get('is_out_of_service') or
@@ -501,10 +518,10 @@ class DispatchBoardDisplayAutomationScraper(BaseScraper):
                 return False
 
         w_time = wo.get("time_key", "")
-        if time_key and w_time:
+        wo_time_keys = wo.get("time_keys") or ({DispatchBoardDisplayAutomationScraper.normalize_time_key(w_time)} if w_time else set())
+        if time_key:
             norm_target = DispatchBoardDisplayAutomationScraper.normalize_time_key(time_key)
-            norm_wo = DispatchBoardDisplayAutomationScraper.normalize_time_key(w_time)
-            if norm_target and norm_wo and norm_target != norm_wo:
+            if norm_target and wo_time_keys and norm_target not in wo_time_keys:
                 if not (is_service_wo or is_oos_wo):
                     return False
 
@@ -532,6 +549,52 @@ class DispatchBoardDisplayAutomationScraper(BaseScraper):
             return True
 
         return False
+
+    @staticmethod
+    def parse_fieldedge_datetime(dt_val: Any) -> Tuple[str, str, Optional[datetime_time]]:
+        """
+        Parses a FieldEdge datetime value into (date_str: YYYY-MM-DD, time_key: I:M p, time_obj: time).
+        Converts UTC timestamps with 'Z' or offset to America/Los_Angeles (Pacific Time).
+        """
+        if not dt_val:
+            return "", "", None
+        raw_str = str(dt_val).strip()
+        if not raw_str:
+            return "", "", None
+
+        has_tz = raw_str.endswith("Z") or bool(re.search(r'[+-]\d{2}:?\d{2}$', raw_str))
+        if has_tz:
+            try:
+                iso_clean = raw_str.replace("Z", "+00:00")
+                parsed_dt = datetime.fromisoformat(iso_clean)
+                pacific_dt = parsed_dt.astimezone(PACIFIC_TZ)
+                date_str = pacific_dt.strftime("%Y-%m-%d")
+                time_key = pacific_dt.strftime("%I:%M %p")
+                if time_key.startswith("0"):
+                    time_key = time_key[1:]
+                return date_str, time_key, pacific_dt.time()
+            except Exception:
+                pass
+
+        clean_naive = re.sub(r'[+-]\d{2}:?\d{2}$', '', raw_str.replace("Z", "")).replace("T", " ").split(".")[0].strip()
+        for fmt in [
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M",
+            "%I:%M %p",
+            "%H:%M:%S",
+            "%H:%M"
+        ]:
+            try:
+                local_dt = datetime.strptime(clean_naive, fmt)
+                date_str = local_dt.strftime("%Y-%m-%d") if "%Y" in fmt else ""
+                time_key = local_dt.strftime("%I:%M %p")
+                if time_key.startswith("0"):
+                    time_key = time_key[1:]
+                return date_str, time_key, local_dt.time()
+            except Exception:
+                pass
+
+        return "", "", None
 
     def extract_existing_wos(self, board_data, target_date_key: Optional[str] = None):
         if not board_data or "Board" not in board_data:
@@ -575,29 +638,38 @@ class DispatchBoardDisplayAutomationScraper(BaseScraper):
                         item.get("StartDateTime") or
                         item.get("StartTime")
                     )
-                    time_key = ""
-                    item_date_str = ""
+                    item_date_str, time_key, time_obj = self.parse_fieldedge_datetime(dt_str)
+
+                    naive_date_str = ""
+                    naive_time_key = ""
                     if dt_str:
-                        dt_clean = re.sub(r'[+-]\d{2}:?\d{2}$', '', str(dt_str).replace("Z", "")).replace("T", " ").split(".")[0].strip()
-                        for fmt in [
-                            "%Y-%m-%d %H:%M:%S",
-                            "%Y-%m-%d %H:%M",
-                            "%I:%M %p",
-                            "%H:%M:%S",
-                            "%H:%M"
-                        ]:
+                        raw_dt_clean = re.sub(r'[+-]\d{2}:?\d{2}$', '', str(dt_str).replace("Z", "")).replace("T", " ").split(".")[0].strip()
+                        for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%I:%M %p", "%H:%M:%S", "%H:%M"]:
                             try:
-                                local_dt = datetime.strptime(dt_clean, fmt)
-                                time_key = local_dt.strftime("%I:%M %p")
-                                if time_key.startswith("0"): time_key = time_key[1:]
+                                ldt = datetime.strptime(raw_dt_clean, fmt)
                                 if "%Y" in fmt:
-                                    item_date_str = local_dt.strftime("%Y-%m-%d")
+                                    naive_date_str = ldt.strftime("%Y-%m-%d")
+                                t_k = ldt.strftime("%I:%M %p")
+                                if t_k.startswith("0"): t_k = t_k[1:]
+                                naive_time_key = t_k
                                 break
                             except Exception:
                                 pass
 
-                    if effective_date and item_date_str and item_date_str != effective_date:
-                        continue
+                    if effective_date:
+                        date_matches = (
+                            item_date_str == effective_date or
+                            naive_date_str == effective_date or
+                            (not item_date_str and not naive_date_str)
+                        )
+                        if not date_matches:
+                            continue
+
+                    time_keys = set()
+                    if time_key:
+                        time_keys.add(self.normalize_time_key(time_key))
+                    if naive_time_key:
+                        time_keys.add(self.normalize_time_key(naive_time_key))
 
                     item_prio = str(item.get("Priority") or item.get("PriorityName") or item.get("PriorityDescription") or "")
                     norm_prio = re.sub(r'[^a-zA-Z0-9]', '', item_prio).lower()
@@ -606,20 +678,23 @@ class DispatchBoardDisplayAutomationScraper(BaseScraper):
                         "serviceneeded" in norm_prio or
                         "712" in norm_prio or
                         any("serviceneeded" in s.lower() or "712" in s for s in canon_strings) or
-                        (time_key in ["3:30 PM", "3:30", "03:30 PM", "3:30pm"] and canon_tech in ["s3", "s4"])
+                        bool(time_keys.intersection({"3:30 PM", "3:30", "03:30 PM", "3:30pm"})) and canon_tech in ["s3", "s4"]
                     )
 
                     is_oos = (
                         "donotdispatch" in norm_prio or
                         "outofservice" in norm_prio or
-                        any("donotdispatch" in s.lower() or "outofservice" in s.lower() for s in canon_strings)
+                        any("donotdispatch" in s.lower() or "outofservice" in s.lower() for s in canon_strings) or
+                        bool(time_keys.intersection({"1:45 PM", "1:45", "01:45 PM", "1:45pm"})) and canon_tech in ["s3", "s4"]
                     )
                             
                     existing_wos[canon_tech].append({
                         "canon_customer": canon_customer,
                         "canon_strings": canon_strings,
                         "canon_combined": canon_combined,
-                        "time_key": time_key,
+                        "time_key": time_key or naive_time_key,
+                        "time_keys": time_keys,
+                        "time_obj": time_obj,
                         "is_service_needed": is_sn,
                         "is_out_of_service": is_oos,
                         "is_appointment": False
@@ -642,48 +717,8 @@ class DispatchBoardDisplayAutomationScraper(BaseScraper):
                         appt.get("StartTime")
                     )
                     dt_to_str = appt.get("ScheduledTo") or appt.get("EndDateTime")
-                    time_key = ""
-                    start_time_obj = None
-                    end_time_obj = None
-                    appt_from_date = ""
-                    appt_to_date = ""
-                    if dt_str:
-                        dt_clean = re.sub(r'[+-]\d{2}:?\d{2}$', '', str(dt_str).replace("Z", "")).replace("T", " ").split(".")[0].strip()
-                        for fmt in [
-                            "%Y-%m-%d %H:%M:%S",
-                            "%Y-%m-%d %H:%M",
-                            "%I:%M %p",
-                            "%H:%M:%S",
-                            "%H:%M"
-                        ]:
-                            try:
-                                local_dt = datetime.strptime(dt_clean, fmt)
-                                time_key = local_dt.strftime("%I:%M %p")
-                                if time_key.startswith("0"): time_key = time_key[1:]
-                                start_time_obj = local_dt.time()
-                                if "%Y" in fmt:
-                                    appt_from_date = local_dt.strftime("%Y-%m-%d")
-                                break
-                            except Exception:
-                                pass
-                            
-                    if dt_to_str:
-                        dt_to_clean = re.sub(r'[+-]\d{2}:?\d{2}$', '', str(dt_to_str).replace("Z", "")).replace("T", " ").split(".")[0].strip()
-                        for fmt in [
-                            "%Y-%m-%d %H:%M:%S",
-                            "%Y-%m-%d %H:%M",
-                            "%I:%M %p",
-                            "%H:%M:%S",
-                            "%H:%M"
-                        ]:
-                            try:
-                                local_dt_to = datetime.strptime(dt_to_clean, fmt)
-                                end_time_obj = local_dt_to.time()
-                                if "%Y" in fmt:
-                                    appt_to_date = local_dt_to.strftime("%Y-%m-%d")
-                                break
-                            except Exception:
-                                pass
+                    appt_from_date, time_key, start_time_obj = self.parse_fieldedge_datetime(dt_str)
+                    appt_to_date, _, end_time_obj = self.parse_fieldedge_datetime(dt_to_str)
 
                     if effective_date:
                         if appt_to_date and appt_to_date < effective_date:
@@ -704,12 +739,13 @@ class DispatchBoardDisplayAutomationScraper(BaseScraper):
         return board_date_str, existing_wos
 
     async def fetch_board_data_for_date(self, target_date_str: str, board_req: dict):
-        if not board_req or not board_req.get("url"):
+        req_to_use = board_req or getattr(self, 'board_req', {})
+        if not req_to_use or not req_to_use.get("url"):
             print(f"  ⚠️ Cannot dynamically fetch board data for {target_date_str}: board_req template missing.")
             return None, {}
 
         try:
-            payload = json.loads(board_req["post_data"])
+            payload = json.loads(req_to_use.get("post_data") or "{}")
             payload["Date"] = target_date_str + "T00:00:00"
             for k in list(payload.keys()):
                 if "date" in k.lower():
@@ -718,19 +754,26 @@ class DispatchBoardDisplayAutomationScraper(BaseScraper):
                     else:
                         payload[k] = target_date_str + "T00:00:00"
 
-            headers = board_req.get("headers", {})
+            headers = dict(req_to_use.get("headers", {}))
+            cleaned_headers = {}
+            forbidden = {'host', 'content-length', 'connection', 'origin', 'referer', 'sec-fetch-dest', 'sec-fetch-mode', 'sec-fetch-site'}
+            for hk, hv in headers.items():
+                if hk.lower() not in forbidden and not hk.startswith(':'):
+                    cleaned_headers[hk] = hv
+            cleaned_headers['Content-Type'] = 'application/json'
+
             fetch_js = f"""
             async () => {{
                 try {{
-                    const resp = await fetch("{board_req['url']}", {{
+                    const resp = await fetch("{req_to_use['url']}", {{
                         method: 'POST',
-                        headers: {{
-                            'Content-Type': 'application/json',
-                            'Authorization': '{headers.get('authorization', '')}',
-                            'FE-CSRF-TOKEN': '{headers.get('fe-csrf-token', '')}'
-                        }},
+                        credentials: 'include',
+                        headers: {json.dumps(cleaned_headers)},
                         body: JSON.stringify({json.dumps(payload)})
                     }});
+                    if (!resp.ok) {{
+                        return {{ error: 'HTTP ' + resp.status, status: resp.status }};
+                    }}
                     return await resp.json();
                 }} catch(e) {{
                     return {{ error: e.toString() }};
@@ -738,15 +781,55 @@ class DispatchBoardDisplayAutomationScraper(BaseScraper):
             }}
             """
             new_data = await self.page.evaluate(fetch_js)
-            if new_data and "Board" in new_data:
+            if new_data and isinstance(new_data, dict) and "Board" in new_data:
+                self.intercepted_board_by_date[target_date_str] = new_data
                 b_date, e_wos = self.extract_existing_wos(new_data, target_date_key=target_date_str)
-                print(f"📡 Dynamically fetched board date: '{b_date}' | Found {len(e_wos)} tech groups.")
+                total_wos = sum(len(w_l) for w_l in e_wos.values())
+                print(f"📡 Dynamically fetched board date: '{b_date}' | Found {len(e_wos)} tech groups, {total_wos} existing work orders.")
                 return b_date, e_wos
             else:
-                print(f"⚠️ Dynamic board fetch returned invalid response for {target_date_str}: {new_data}")
+                err_msg = new_data.get("error") if isinstance(new_data, dict) else str(new_data)
+                print(f"⚠️ Dynamic board fetch returned invalid response for {target_date_str}: {err_msg}")
         except Exception as e:
             print(f"⚠️ Exception fetching board data for {target_date_str}: {e}")
         return None, {}
+
+    async def get_or_fetch_board_data_for_date(self, target_date_obj: datetime, max_retries: int = 2) -> Tuple[Optional[str], Optional[Dict]]:
+        target_date_key = target_date_obj.strftime("%Y-%m-%d")
+
+        # 1. First check if we already have it in cache
+        if target_date_key in self.intercepted_board_by_date:
+            b_data = self.intercepted_board_by_date[target_date_key]
+            b_date, e_wos = self.extract_existing_wos(b_data, target_date_key=target_date_key)
+            total_items = sum(len(w_list) for w_list in e_wos.values())
+            print(f"📡 Verified FieldEdge API board data from cache for {target_date_key}: {len(e_wos)} tech groups, {total_items} items.")
+            return b_date, e_wos
+
+        # 2. Navigate to the date on the Dispatch Board
+        await self.navigate_to_board_date(target_date_obj)
+
+        # 3. Dynamic fetch via page.evaluate
+        if self.board_req and self.board_req.get("url"):
+            print(f"🔄 Fetching FieldEdge API board data for target date {target_date_key}...")
+            b_date, e_wos = await self.fetch_board_data_for_date(target_date_key, self.board_req)
+            if b_date == target_date_key and e_wos is not None:
+                total_items = sum(len(w_list) for w_list in e_wos.values())
+                print(f"📡 Verified FieldEdge API board data via fetch for {target_date_key}: {len(e_wos)} tech groups, {total_items} items.")
+                return b_date, e_wos
+
+        # 4. If retry is allowed, retry once
+        if max_retries > 0:
+            print(f"🔁 Retrying FieldEdge API board fetch for {target_date_key}...")
+            await self.page.wait_for_timeout(1000)
+            b_date, e_wos = await self.fetch_board_data_for_date(target_date_key, self.board_req)
+            if b_date == target_date_key and e_wos is not None:
+                total_items = sum(len(w_list) for w_list in e_wos.values())
+                print(f"📡 Verified FieldEdge API board data on retry for {target_date_key}: {len(e_wos)} tech groups, {total_items} items.")
+                return b_date, e_wos
+
+        # 5. If STILL not verified, do NOT guess or default to empty dict! Return None to indicate failure!
+        print(f"⛔ CRITICAL SAFETY GUARD: Could NOT verify FieldEdge Dispatch Board API for date {target_date_key}!")
+        return None, None
 
     async def navigate_to_board_date(self, target_date_obj: datetime) -> bool:
         try:
@@ -762,7 +845,8 @@ class DispatchBoardDisplayAutomationScraper(BaseScraper):
                     await spinners.first.wait_for(state="hidden", timeout=4000)
             except Exception:
                 pass
-            await self.page.wait_for_timeout(1500)
+
+            await self.page.wait_for_timeout(1000)
             return True
         except Exception as e:
             print(f"⚠️ Could not navigate to board date via URL {target_url}: {e}")
@@ -826,43 +910,78 @@ class DispatchBoardDisplayAutomationScraper(BaseScraper):
 
         await self.ensure_clean_dispatch_board()
 
-        try:
-            buttons = self.page.locator(xpath)
-            await buttons.first.wait_for(state="attached", timeout=30000)
-            
-            count = await buttons.count()
-            clicked = False
-            for i in range(count):
-                btn = buttons.nth(i)
-                if await btn.is_visible():
-                    await btn.scroll_into_view_if_needed()
-                    await btn.click(force=True)
-                    try:
-                        await self.page.evaluate("(el) => el.click()", await btn.element_handle())
-                    except Exception:
-                        pass
-                    clicked = True
-                    break
-            
-            if not clicked:
-                raise Exception("No visible Create Work Order button found.")
-                
-            customer_xpath = self.rules.get(
+        customer_modal_selectors = [
+            self.rules.get(
                 'dispatch_board_customer_xpath',
                 "//div[@class[contains(.,'field-title')] and contains(normalize-space(),'Customer Name')]/following::div[contains(@class,'v-select')][1]"
-            )
-            import time
+            ),
+            "#vscreate-wo-customer-select",
+            "#vscreate-wo-customer-select__combobox",
+            "div[id*='vscreate-wo-customer-select']",
+            ".customer-select",
+            ".customer-search-container"
+        ]
+
+        # 1. Quick check: is the Create Work Order modal ALREADY open from a previous step?
+        for cand in customer_modal_selectors:
+            try:
+                m_loc = self.page.locator(cand).first
+                if await m_loc.count() > 0 and await m_loc.is_visible():
+                    return True
+            except Exception:
+                pass
+
+        # 2. Wait for any loading spinners or overlays to clear first
+        try:
+            spinners = self.page.locator(".loading, .spinner, .v-spinner, div[class*='loading']:visible")
+            if await spinners.count() > 0:
+                await spinners.first.wait_for(state="hidden", timeout=5000)
+        except Exception:
+            pass
+
+        btn_candidates = [
+            xpath,
+            "//button[contains(normalize-space(), 'Create Work Order') or contains(normalize-space(), 'Work Order')]",
+            "button:has-text('Create Work Order')",
+            "button:has-text('Work Order')",
+            "button[data-automation-id*='create-wo']",
+            "button[class*='create-wo']"
+        ]
+
+        # 3. Robust polling loop: give FieldEdge up to 10 seconds to finish rendering and make button visible
+        import time
+        start_t = time.time()
+        clicked = False
+
+        while time.time() - start_t < 10:
+            for cand in btn_candidates:
+                try:
+                    btns = self.page.locator(cand)
+                    c = await btns.count()
+                    for i in range(c):
+                        btn = btns.nth(i)
+                        if await btn.is_visible():
+                            await btn.scroll_into_view_if_needed()
+                            try:
+                                await btn.click(timeout=1500)
+                            except Exception:
+                                await self.page.evaluate("(el) => el.click()", await btn.element_handle())
+                            clicked = True
+                            break
+                    if clicked:
+                        break
+                except Exception:
+                    pass
+            if clicked:
+                break
+            await self.page.wait_for_timeout(300)
+
+        # 4. Wait for modal to appear
+        if clicked:
             _modal_start = time.time()
             modal_visible = False
-            while time.time() - _modal_start < 30:
-                for cand in [
-                    customer_xpath,
-                    "#vscreate-wo-customer-select",
-                    "#vscreate-wo-customer-select__combobox",
-                    "div[id*='vscreate-wo-customer-select']",
-                    ".customer-select",
-                    ".customer-search-container"
-                ]:
+            while time.time() - _modal_start < 10:
+                for cand in customer_modal_selectors:
                     try:
                         loc = self.page.locator(cand).first
                         if await loc.count() > 0 and await loc.is_visible():
@@ -874,47 +993,73 @@ class DispatchBoardDisplayAutomationScraper(BaseScraper):
                     break
                 await self.page.wait_for_timeout(150)
 
-            if not modal_visible:
-                print("  -> Customer modal element not detected after initial click, attempting JS re-click...")
-                for i in range(count):
-                    btn = buttons.nth(i)
-                    if await btn.is_visible():
-                        try:
-                            await self.page.evaluate("(el) => el.click()", await btn.element_handle())
-                        except Exception:
-                            pass
-                await self.page.wait_for_timeout(1000)
-            return True
-        except Exception as e:
-            print(f"⚠️ Could not locate or click Create Work Order button: {e}. Retrying with fresh dispatch board reload...")
-            try:
-                await self.ensure_clean_dispatch_board(force_reload=True)
-                
-                buttons = self.page.locator(xpath)
-                await buttons.first.wait_for(state="attached", timeout=30000)
-                
-                count = await buttons.count()
-                clicked = False
-                for i in range(count):
-                    btn = buttons.nth(i)
-                    if await btn.is_visible():
-                        await btn.scroll_into_view_if_needed()
-                        await btn.click(force=True)
-                        try:
-                            await self.page.evaluate("(el) => el.click()", await btn.element_handle())
-                        except Exception:
-                            pass
-                        clicked = True
-                        break
-                
-                if not clicked:
-                    raise Exception("No visible Create Work Order button found on retry.")
-                    
-                await self.page.wait_for_timeout(1000)
+            if modal_visible:
                 return True
-            except Exception as retry_err:
-                print(f"❌ Retry also failed: {retry_err}")
+
+            print("  -> Customer modal element not detected after initial click, attempting JS re-click...")
+            for cand in btn_candidates:
+                try:
+                    btns = self.page.locator(cand)
+                    c = await btns.count()
+                    for i in range(c):
+                        btn = btns.nth(i)
+                        if await btn.is_visible():
+                            try:
+                                await self.page.evaluate("(el) => el.click()", await btn.element_handle())
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+            await self.page.wait_for_timeout(1000)
+
+            for cand in customer_modal_selectors:
+                try:
+                    loc = self.page.locator(cand).first
+                    if await loc.count() > 0 and await loc.is_visible():
+                        return True
+                except Exception:
+                    pass
+
+        # 5. Fallback reload retry if initial attempts failed
+        print("⚠️ Could not locate or open Create Work Order modal within 10s. Retrying with fresh dispatch board reload...")
+        try:
+            await self.ensure_clean_dispatch_board(force_reload=True)
+            await self.page.wait_for_timeout(1000)
+
+            retry_clicked = False
+            retry_start = time.time()
+            while time.time() - retry_start < 10:
+                for cand in btn_candidates:
+                    try:
+                        btns = self.page.locator(cand)
+                        c = await btns.count()
+                        for i in range(c):
+                            btn = btns.nth(i)
+                            if await btn.is_visible():
+                                await btn.scroll_into_view_if_needed()
+                                try:
+                                    await btn.click(timeout=1500)
+                                except Exception:
+                                    await self.page.evaluate("(el) => el.click()", await btn.element_handle())
+                                retry_clicked = True
+                                break
+                        if retry_clicked:
+                            break
+                    except Exception:
+                        pass
+                if retry_clicked:
+                    break
+                await self.page.wait_for_timeout(300)
+
+            if not retry_clicked:
+                print("❌ Retry also failed: No visible Create Work Order button found.")
                 return False
+
+            await self.page.wait_for_timeout(1000)
+            return True
+        except Exception as retry_err:
+            print(f"❌ Retry also failed: {retry_err}")
+            return False
 
     async def close_create_wo_modal(self):
         try:
@@ -938,11 +1083,44 @@ class DispatchBoardDisplayAutomationScraper(BaseScraper):
         except Exception:
             return False
 
+    @staticmethod
+    def extract_name_variants(text: str) -> List[str]:
+        """
+        Extracts all useful search & match variants for a name (with and without emojis/pipes).
+        e.g. '👥 | GENE' -> ['👥 | GENE', '| GENE', 'GENE']
+             '🛻 | 04'   -> ['🛻 | 04', '| 04', '04']
+             ' GENE'     -> [' GENE', 'GENE']
+        """
+        variants = []
+        if not text:
+            return variants
+        raw = str(text).strip()
+        variants.append(raw)
+
+        # 1. Strip emojis and astral unicode symbols
+        no_emoji = re.sub(r'[\U00010000-\U0010ffff\u2600-\u27bf\ufe0f\u200d]', '', raw).strip()
+        if no_emoji and no_emoji != raw:
+            variants.append(no_emoji)
+
+        # 2. Strip leading/trailing pipes, symbols, whitespace, em-spaces
+        clean_core = re.sub(r'^[|#\-_\s\u2000-\u200f]+|[|#\-_\s\u2000-\u200f]+$', '', no_emoji).strip()
+        if clean_core and clean_core not in variants:
+            variants.append(clean_core)
+
+        # 3. Extract after pipe if present
+        if "|" in raw:
+            right_side = raw.split("|")[-1].strip()
+            right_clean = re.sub(r'[\U00010000-\U0010ffff\u2600-\u27bf\ufe0f\u200d\u2000-\u200f]', '', right_side).strip()
+            if right_clean and right_clean not in variants:
+                variants.append(right_clean)
+
+        return variants
+
     _BANNER_EMOJI_REGEX = re.compile(
         r'['
-        r'\u203C-\u3299'
-        r'\U0001F000-\U0001F9FF'
-        r'\U0001FA00-\U0001FAFF'
+        r'\u203C-\u3299'         # Miscellaneous symbols, Dingbats, geometric shapes
+        r'\U0001F000-\U0001F9FF' # Emoticons, transport, supplemental symbols
+        r'\U0001FA00-\U0001FAFF' # Symbols and pictographs extended-A
         r']+'
     )
 
@@ -950,33 +1128,7 @@ class DispatchBoardDisplayAutomationScraper(BaseScraper):
     def has_banner_prefix(cls, t: str) -> bool:
         if not t:
             return False
-        return ('|' in str(t)) or bool(cls._BANNER_EMOJI_REGEX.search(str(t)))
-
-    @staticmethod
-    def _has_qualifier_conflict(s1: str, s2: str) -> bool:
-        t_words = set(re.findall(r'\b[a-zA-Z0-9]+\b', str(s1).lower()))
-        o_words = set(re.findall(r'\b[a-zA-Z0-9]+\b', str(s2).lower()))
-        return (('am' in t_words) != ('am' in o_words)) or (('pm' in t_words) != ('pm' in o_words))
-
-    @staticmethod
-    def extract_name_variants(text: str) -> List[str]:
-        variants = []
-        if not text:
-            return variants
-        raw = str(text).strip()
-        variants.append(raw)
-        no_emoji = re.sub(r'[\u203C-\u3299\U0001F000-\U0001FAFF\ufe0f\u200d]', '', raw).strip()
-        if no_emoji and no_emoji != raw:
-            variants.append(no_emoji)
-        clean_core = re.sub(r'^[|#\-_\s\u2000-\u200f]+|[|#\-_\s\u2000-\u200f]+$', '', no_emoji).strip()
-        if clean_core and clean_core not in variants:
-            variants.append(clean_core)
-        if "|" in raw:
-            right_side = raw.split("|")[-1].strip()
-            right_clean = re.sub(r'[\u203C-\u3299\U0001F000-\U0001FAFF\ufe0f\u200d\u2000-\u200f]', '', right_side).strip()
-            if right_clean and right_clean not in variants:
-                variants.append(right_clean)
-        return variants
+        return ('|' in t) or bool(cls._BANNER_EMOJI_REGEX.search(str(t)))
 
     async def select_dropdown_option(self, dropdown_selector: str, option_text: str, press_enter: bool = True) -> bool:
         if not option_text:
@@ -1663,29 +1815,6 @@ class DispatchBoardDisplayAutomationScraper(BaseScraper):
             except Exception:
                 pass
 
-            try:
-                final_cust = (await self.page.locator(customer_xpath).locator(".vs__selected").text_content() or "").strip()
-                if final_cust:
-                    cust_variants = self.extract_name_variants(customer_name)
-                    cust_canons = set(self.canonical_str(v) for v in cust_variants if self.canonical_str(v))
-                    c_fc = self.canonical_str(final_cust)
-                    c_tc = self.canonical_str(customer_name)
-                    cust_ok = (
-                        not self._has_qualifier_conflict(customer_name, final_cust) and
-                        (
-                            final_cust == customer_name or
-                            final_cust.lower() == customer_name.strip().lower() or
-                            c_fc == c_tc or
-                            c_fc in cust_canons
-                        )
-                    )
-                    if not cust_ok:
-                        print(f"🛑 FINAL PRE-SAVE CHECK FAILED: Customer '{final_cust}' != expected '{customer_name}'. Aborting save.")
-                        await self.close_create_wo_modal()
-                        return False
-            except Exception:
-                pass
-
             if tech_name:
                 final_tech = (await self.page.locator(tech_xpath).locator(".vs__selected").text_content() or "").strip()
                 clean_f = self.canonical_str(final_tech)
@@ -1701,6 +1830,39 @@ class DispatchBoardDisplayAutomationScraper(BaseScraper):
                     print(f"🛑 FINAL PRE-SAVE CHECK FAILED: Primary Tech '{final_tech}' != expected '{tech_name}'. Aborting save.")
                     await self.close_create_wo_modal()
                     return False
+
+            # --- FINAL PRE-SAVE GUARD: CUSTOMER NAME & BANNER/EMOJI VERIFICATION ---
+            final_cust = (await self.page.locator(customer_xpath).locator(".vs__selected, .selected-tag").first.text_content() or "").strip()
+            clean_cust = self.canonical_str(final_cust)
+            clean_target = self.canonical_str(customer_name)
+            cust_name_variants = self.extract_name_variants(customer_name)
+            cust_target_canons = set(self.canonical_str(v) for v in cust_name_variants if self.canonical_str(v))
+
+            target_has_banner = self.has_banner_prefix(customer_name)
+            sel_has_banner = self.has_banner_prefix(final_cust)
+            banner_conflict = (target_has_banner != sel_has_banner)
+
+            is_time_cust = bool(re.search(r'\b\d{1,2}:\d{2}\b', customer_name)) or any(w in ('am', 'pm') for w in re.findall(r'\b[a-zA-Z0-9]+\b', customer_name.lower()))
+            qualifier_conflict = False
+            if is_time_cust:
+                t_words = set(re.findall(r'\b[a-zA-Z0-9]+\b', customer_name.lower()))
+                s_words = set(re.findall(r'\b[a-zA-Z0-9]+\b', final_cust.lower()))
+                qualifier_conflict = ((('am' in t_words) != ('am' in s_words)) or (('pm' in t_words) != ('pm' in s_words)))
+
+            name_matched = (
+                final_cust == customer_name or
+                clean_cust == clean_target or
+                clean_cust in cust_target_canons or
+                final_cust in cust_name_variants or
+                any(v.lower() == final_cust.lower() for v in cust_name_variants) or
+                self.is_tech_match(final_cust, customer_name)
+            )
+
+            if qualifier_conflict or not name_matched:
+                reason = "time qualifier conflict" if qualifier_conflict else "name mismatch"
+                print(f"🛑 FINAL PRE-SAVE CHECK FAILED: Customer '{final_cust}' ({reason}) != expected '{customer_name}'. Aborting save to prevent invalid work order.")
+                await self.close_create_wo_modal()
+                return False
 
             save_btn = None
             for save_sel in [
@@ -2154,6 +2316,8 @@ class DispatchBoardDisplayAutomationScraper(BaseScraper):
         truck_assign_headers = [
             h for h in self.template_data.get("truck_assign_headers", [])
             if h.get("active", True)
+            and (h.get("tech_name") or "").strip()
+            and (h.get("tech_name") or "").strip().lower() not in ("unassigned", "none", "clear")
         ]
 
         out_of_service_headers = []
@@ -2208,42 +2372,38 @@ class DispatchBoardDisplayAutomationScraper(BaseScraper):
             print(f"🚫 Exempted {len(oos_canonical_names)} Out of Service vehicle(s) from standard categories: {', '.join([s['name'] for s in out_of_service_headers])}")
 
         service_needed_headers = []
+        sn_canonical_names = set()
+        sn_asset_numbers = set()
+        sn_map = {}
+
         for sn in self.template_data.get("service_needed_assets", []):
             if not sn.get("active", True):
                 continue
-            sn_name = (sn.get("name") or sn.get("asset_name") or "").strip()
+            sn_name = (sn.get("asset_name") or "").strip()
             if not sn_name:
                 continue
             if self.canonical_str(sn_name) in oos_canonical_names:
                 continue
-            # Note: Even if this asset is assigned to a real tech in truck_assign_headers (e.g. 🚛 | 123 on Mackie),
-            # the s4 Service Needed tracking card MUST still be created on s4 at 3:30 PM.
-            # Both WOs must exist: one for daily tech assignment, and one on s4 for maintenance tracking.
-            sn_time = sn.get("start_time") or "3:30 PM"
+
+            c_n = self.canonical_str(sn_name)
+            sn_canonical_names.add(c_n)
+            sn_map[c_n] = sn
+            after_pipe = sn_name.split("|")[-1].strip() if "|" in sn_name else sn_name.strip()
+            if re.match(r'^\d{2,4}$', after_pipe):
+                sn_asset_numbers.add(after_pipe)
+                sn_map[after_pipe] = sn
+
             service_needed_headers.append({
                 "name": sn_name,
-                "start_time": sn_time,
+                "start_time": sn.get("start_time") or "3:30 PM",
                 "duration": sn.get("duration") or "1:00",
                 "priority": sn.get("priority") or "[7] 7.12 SERVICE NEEDED",
-                "tech_name": sn.get("tech_name") or "s4",
+                "tech_name": "s4",
                 "service_note": sn.get("service_note") or "",
                 "is_service_needed_duplicate": True,
                 "active": True,
                 "task": sn.get("task", task),
             })
-
-        sn_canonical_names = set()
-        sn_asset_numbers = set()
-        for sn in self.template_data.get("service_needed_assets", []):
-            if not sn.get("active", True):
-                continue
-            sn_a_name = (sn.get("name") or sn.get("asset_name") or "").strip()
-            c_n = self.canonical_str(sn_a_name)
-            if c_n:
-                sn_canonical_names.add(c_n)
-            after_pipe = sn_a_name.split("|")[-1].strip() if "|" in sn_a_name else sn_a_name
-            if re.match(r'^\d{2,4}$', after_pipe):
-                sn_asset_numbers.add(after_pipe)
 
         def _is_sn_asset(header_item):
             h_name = header_item.get("name", "")
@@ -2260,31 +2420,36 @@ class DispatchBoardDisplayAutomationScraper(BaseScraper):
                         return True
             return False
 
-        # On s4/s3, each truck should only exist ONCE (either as Service Needed, OOS, or regular static).
-        # Remove any static headers on s4/s3 for trucks that are already in service_needed_assets.
-        if sn_canonical_names:
-            static_headers = [
-                h for h in static_headers
-                if not (_is_sn_asset(h) and h.get("tech_name", "").lower() in ("s4", "s3", ""))
-            ]
-        assigned_truck_names = {
-            self.canonical_str(t.get("name", "")) for t in truck_assign_headers
-            if t.get("active", True) and t.get("tech_name") and t.get("tech_name").strip().lower() not in ("", "s4", "s3")
-        }
-        if assigned_truck_names:
-            static_headers = [
-                h for h in static_headers
-                if not (
-                    self.canonical_str(h.get("name", "")) in assigned_truck_names and
-                    h.get("tech_name", "").lower() in ("s4", "s3", "")
-                )
-            ]
-        if service_needed_headers:
-            print(f"🔧 Configured {len(service_needed_headers)} Service Needed vehicle(s) on s4: {', '.join([s['name'] for s in service_needed_headers])}")
+        # Match truck_assign_headers with service_needed_assets
+        # If a truck is assigned to a technician AND has Service Needed:
+        # Keep it on the technician at their scheduled time, attach note,
+        # AND ALSO create the Service Needed card under '🔧 SERVICE NEEDED' at 3:30 PM!
+        for h in truck_assign_headers:
+            h_name = h.get("name", "")
+            c_h = self.canonical_str(h_name)
+            after_p = h_name.split("|")[-1].strip() if "|" in h_name else h_name.strip()
+            sn_obj = sn_map.get(c_h) or (sn_map.get(after_p) if re.match(r'^\d{2,4}$', after_p) else None)
 
-        special_headers = out_of_service_headers + service_needed_headers
-        if special_headers:
-            static_headers = special_headers + static_headers
+            h_tech = (h.get("tech_name") or "").strip()
+            is_assigned = h.get("active", True) and h_tech and h_tech.lower() not in ("unassigned", "none", "clear")
+
+            if sn_obj and is_assigned:
+                h["service_note"] = sn_obj.get("service_note") or ""
+                h["summary_note"] = sn_obj.get("service_note") or ""
+                h["is_service_needed"] = True
+                print(f"🔧 Truck '{h_name}' on tech '{h_tech}' marked with Service Needed note at {h.get('start_time')}.")
+
+        # Remove Service Needed assets from regular static fleet headers on s4 (5:00 AM / 7:00 AM)
+        # because on s4 they are tracked exclusively under '🔧 SERVICE NEEDED' at 3:30 PM.
+        # Note: Do NOT remove them from truck_assign_headers; techs can still drive them.
+        if sn_canonical_names:
+            static_headers = [h for h in static_headers if not _is_sn_asset(h)]
+            print(f"🚫 Exempted {len(sn_canonical_names)} Service Needed vehicle(s) from static morning headers: {', '.join([s['name'] for s in service_needed_headers])}")
+
+        # Service Needed assets MUST ALWAYS be included under '🔧 SERVICE NEEDED' at 3:30 PM on s4
+        if service_needed_headers:
+            static_headers = static_headers + service_needed_headers
+            print(f"🔧 Added {len(service_needed_headers)} Service Needed header(s) under 3:30 PM.")
         tech_defaults = self.template_data.get("technician_display_defaults", {})
         tech_jobs = self.template_data.get("tech_jobs", [])
 
@@ -2340,33 +2505,18 @@ class DispatchBoardDisplayAutomationScraper(BaseScraper):
         else:
             await self.initialize()
             
-            board_data = None
-            board_req = {}
+            self.intercepted_board_by_date.clear()
+            self.board_req.clear()
             
             async def handle_request(request):
-                nonlocal board_req
                 if "GetDispatchBoardData" in request.url and request.method == "POST":
-                    board_req["url"] = request.url
-                    board_req["headers"] = request.headers
-                    board_req["post_data"] = request.post_data
+                    self.board_req["url"] = request.url
+                    self.board_req["headers"] = request.headers
+                    self.board_req["post_data"] = request.post_data
                     
             self.page.on("request", handle_request)
             
-            async def handle_response(response):
-                nonlocal board_data
-                if "GetDispatchBoardData" in response.url:
-                    if response.status != 200 or response.request.method != "POST":
-                        return
-                    try:
-                        text = await response.text()
-                        if text:
-                            board_data = json.loads(text)
-                            print("📡 Intercepted Dispatch Board API data successfully.")
-                    except Exception as e:
-                        if "getResponseBody" not in str(e):
-                            print(f"⚠️ Failed to parse intercepted board data: {e}")
-
-            self.page.on("response", handle_response)
+            # Response interception removed per user request. Board data is fetched on-demand via fetch_board_data_for_date.
             
             
             dispatch_url = self.rules.get('web_url', 'https://login.fieldedge.com/Dispatch')
@@ -2387,18 +2537,12 @@ class DispatchBoardDisplayAutomationScraper(BaseScraper):
             
             print("⏳ Waiting for Dispatch Board JSON API data to intercept...")
             for _ in range(50):
-                if board_data is not None:
+                if self.board_req.get("url"):
                     break
                 await self.page.wait_for_timeout(200)
 
-            board_date_str, existing_wos = self.extract_existing_wos(board_data)
-            initial_target_key = start_dt.strftime("%Y-%m-%d")
-            if board_date_str and board_date_str != initial_target_key:
-                print(f"🗓️ Initial board date ('{board_date_str}') does not match requested start date ('{initial_target_key}'). Navigating UI date picker...")
-                await self.navigate_to_board_date(start_dt)
-                fetched_date, fetched_wos = await self.fetch_board_data_for_date(initial_target_key, board_req)
-                if fetched_date == initial_target_key:
-                    board_date_str, existing_wos = fetched_date, fetched_wos
+            board_date_str = None
+            existing_wos = {}
 
         created_history = self._load_history()
         print(f"📚 Loaded {len(created_history)} recorded entries from Central Dashboard API.")
@@ -2463,21 +2607,13 @@ class DispatchBoardDisplayAutomationScraper(BaseScraper):
                 if not skip_stage1:
 
                     if not dry_run:
-                        if board_date_str != db_date_key or "DispatchBoard" not in (self.page.url or ""):
-                            print(f"🗓️ Navigating UI date picker to {db_date_key}...")
-                            nav_ok = await self.navigate_to_board_date(current_date)
-                            print(f"🔄 Fetching board data for target date {db_date_key}...")
-                            fetched_date, fetched_wos = await self.fetch_board_data_for_date(db_date_key, board_req)
-                            if fetched_date == db_date_key:
-                                board_date_str = fetched_date
-                                existing_wos = fetched_wos
-                            elif nav_ok:
-                                board_date_str = db_date_key
-                                existing_wos = fetched_wos or {}
-                            else:
-                                print(f"⛔ Board date '{board_date_str}' does NOT match target date '{db_date_key}' and dynamic fetch could not confirm board state.")
-                                print(f"⛔ Skipping creation for date {db_date_key} to prevent duplicate work orders.")
-                                continue
+                        b_date, e_wos = await self.get_or_fetch_board_data_for_date(current_date)
+                        if e_wos is None:
+                            print(f"⛔ [SAFETY GUARD] FieldEdge Dispatch Board API data could NOT be verified for {db_date_key} ({date_str})!")
+                            print(f"⛔ Skipping creation for date {db_date_key} to PREVENT DUPLICATE WORK ORDERS!")
+                            continue
+                        board_date_str = b_date or db_date_key
+                        existing_wos = e_wos
 
                     for header in static_headers:
                         name = header.get("name")
@@ -2491,7 +2627,7 @@ class DispatchBoardDisplayAutomationScraper(BaseScraper):
                             canon_target = self.canonical_str(name)
                             is_service_wo = bool(
                                 header.get('is_service_needed_duplicate') or
-                                ('SERVICE NEEDED' in str(header.get('priority', '')) or '7.12' in str(header.get('priority', '')))
+                                (header.get('service_note') and ('SERVICE NEEDED' in str(header.get('priority', '')) or '7.12' in str(header.get('priority', ''))))
                             )
                             is_oos_wo = bool(
                                 header.get('is_out_of_service') or
@@ -2522,13 +2658,23 @@ class DispatchBoardDisplayAutomationScraper(BaseScraper):
                                 continue
 
                             if is_service_wo:
-                                sn_already_on_s4 = False
-                                for w in existing_wos.get(canon_h_tech, []):
-                                    if not w.get("is_appointment") and self.check_item_match(w, canon_target, require_customer_match=True, is_service_wo=True):
-                                        sn_already_on_s4 = True
+                                sn_existing_found = False
+                                for c_tk, w_list in existing_wos.items():
+                                    if canon_h_tech and not (c_tk == canon_h_tech or c_tk in ("s4", "s3", "")):
+                                        continue
+                                    for w in w_list:
+                                        if not w.get("is_appointment") and self.check_item_match(w, canon_target, require_customer_match=True, match_any_status=True):
+                                            w_time = self.normalize_time_key(w.get("time_key", ""))
+                                            norm_target_time = self.normalize_time_key(time_key)
+                                            is_sn_slot = bool(norm_target_time and w_time == norm_target_time)
+                                            if w.get("is_service_needed") or is_sn_slot:
+                                                sn_existing_found = True
+                                                break
+                                    if sn_existing_found:
                                         break
-                                if sn_already_on_s4:
-                                    print(f"⏭️ Service Needed asset '{name}' ALREADY exists on tech '{h_tech}' for {date_str}. Skipping duplicate creation.")
+                                
+                                if sn_existing_found:
+                                    print(f"⏭️ Service Needed card for asset '{name}' ALREADY exists at {time_key} on the board for {date_str}. Skipping 2nd creation.")
                                     self.record_wo_created(created_history, db_date_key, canon_h_tech, tracking_target, 1, status="existing_on_board", details={"name": name, "tech": h_tech, "time": time_key})
                                     continue
 
@@ -2547,17 +2693,37 @@ class DispatchBoardDisplayAutomationScraper(BaseScraper):
                                     self.record_wo_created(created_history, db_date_key, canon_h_tech, tracking_target, 1, status="existing_on_board", details={"name": name, "tech": h_tech, "time": time_key})
                                     continue
 
-                            # On s4/s3, each vehicle should only appear ONCE.
-                            # If it's already on s4 (e.g. created earlier as Service Needed or OOS), skip duplicate static header on s4.
-                            if canon_h_tech in ("s4", "s3", "") and not is_service_wo and not is_oos_wo:
-                                truck_already_on_s4 = False
-                                for w in existing_wos.get(canon_h_tech, []):
-                                    if not w.get("is_appointment") and self.check_item_match(w, canon_target, require_customer_match=True, match_any_status=True):
-                                        truck_already_on_s4 = True
+                            if not is_service_wo and not is_oos_wo:
+                                asset_already_oos = False
+                                for c_tk, w_list in existing_wos.items():
+                                    for w in w_list:
+                                        if not w.get("is_appointment") and self.check_item_match(w, canon_target, require_customer_match=True, match_any_status=True):
+                                            if w.get("is_out_of_service") and canon_target in oos_canonical_names:
+                                                asset_already_oos = True
+                                                break
+                                    if asset_already_oos:
                                         break
-                                if truck_already_on_s4:
-                                    print(f"⏭️ Asset '{name}' is ALREADY on tech '{h_tech}' for {date_str}. Skipping duplicate static header on s4 (only 1 WO per truck allowed on s4).")
-                                    self.record_wo_created(created_history, db_date_key, canon_h_tech, tracking_target, target_count_idx, status="existing_on_board", details={"name": name, "tech": h_tech, "time": time_key})
+                                if asset_already_oos:
+                                    print(f"⏭️ Asset '{name}' is OUT OF SERVICE for {date_str}. Skipping standard static header creation.")
+                                    continue
+
+                                # SAFETY CHECK: If this asset is Service Needed, it is tracked under '🔧 SERVICE NEEDED' at 3:30 PM on s4!
+                                # Do NOT create a morning static header (5:00 AM / 7:00 AM) for it on s4!
+                                asset_already_sn = False
+                                if _is_sn_asset(header) or canon_target in sn_canonical_names:
+                                    asset_already_sn = True
+                                else:
+                                    for c_tk, w_list in existing_wos.items():
+                                        if c_tk in DUMMY_HEADER_TECHS or c_tk == canon_h_tech or c_tk in ("s4", "s3", ""):
+                                            for w in w_list:
+                                                if not w.get("is_appointment") and self.check_item_match(w, canon_target, require_customer_match=True, match_any_status=True):
+                                                    if w.get("is_service_needed") or "3:30" in str(w.get("time_key", "")):
+                                                        asset_already_sn = True
+                                                        break
+                                            if asset_already_sn:
+                                                break
+                                if asset_already_sn:
+                                    print(f"⏭️ Asset '{name}' is SERVICE NEEDED (tracked under 3:30 PM on s4) for {date_str}. Skipping standard static header creation.")
                                     continue
 
                             board_count = 0
@@ -2575,9 +2741,31 @@ class DispatchBoardDisplayAutomationScraper(BaseScraper):
                                 if tech_match:
                                     for wo in wo_list:
                                         if not wo.get("is_appointment"):
-                                            check_time = None if canon_h_tech in ("s4", "s3", "f2", "p2") else time_key
-                                            if self.check_item_match(wo, canon_target, check_time, is_service_wo=is_service_wo, is_oos_wo=is_oos_wo, match_any_status=(is_service_wo or is_oos_wo or canon_h_tech in ("s4", "s3", "f2", "p2"))):
+                                            is_dummy_tech = (
+                                                canon_h_tech in DUMMY_HEADER_TECHS or
+                                                any(canon_h_tech.startswith(dt) for dt in DUMMY_HEADER_TECHS)
+                                            )
+                                            if self.check_item_match(
+                                                wo,
+                                                canon_target,
+                                                time_key,
+                                                is_service_wo=is_service_wo,
+                                                is_oos_wo=is_oos_wo,
+                                                match_any_status=(is_service_wo or is_oos_wo or is_dummy_tech)
+                                            ):
                                                 board_count += 1
+                                            elif is_dummy_tech and not is_service_wo and not is_oos_wo:
+                                                # If this item name is unique on this technician column (only 1 occurrence in template),
+                                                # count it even if scheduled time was slightly adjusted on the board
+                                                if sum(1 for h in static_headers if self.canonical_str(h.get("tech_name", "")) == canon_h_tech and self.canonical_str(h.get("name", "")) == canon_target) == 1:
+                                                    if self.check_item_match(
+                                                        wo,
+                                                        canon_target,
+                                                        time_key=None,
+                                                        require_customer_match=True,
+                                                        match_any_status=True
+                                                    ):
+                                                        board_count += 1
                                         else:
                                             appt_matched = False
                                             if wo.get("start_time_obj") and wo.get("end_time_obj") and time_key:
@@ -2603,7 +2791,7 @@ class DispatchBoardDisplayAutomationScraper(BaseScraper):
                         else:
                             is_service_wo = bool(
                                 header.get('is_service_needed_duplicate') or
-                                ('SERVICE NEEDED' in str(header.get('priority', '')) or '7.12' in str(header.get('priority', '')))
+                                (header.get('service_note') and ('SERVICE NEEDED' in str(header.get('priority', '')) or '7.12' in str(header.get('priority', ''))))
                             )
                             h_note = header.get("service_note") or header.get("reason")
                             res = await self.fill_and_save_work_order(
@@ -2637,8 +2825,30 @@ class DispatchBoardDisplayAutomationScraper(BaseScraper):
 
                             if res:
                                 self.record_wo_created(created_history, db_date_key, canon_h_tech, tracking_target, target_count_idx, status="created", details={"name": name, "tech": h_tech, "time": time_key})
-                                f_date, f_wos = await self.fetch_board_data_for_date(db_date_key, board_req)
-                                if f_date == db_date_key:
+                                opt_wo = {
+                                    "canon_customer": canon_target,
+                                    "canon_strings": [canon_target],
+                                    "canon_combined": canon_target,
+                                    "time_key": time_key,
+                                    "is_service_needed": is_service_wo,
+                                    "is_out_of_service": is_oos_wo,
+                                    "is_appointment": False
+                                }
+                                if canon_h_tech not in existing_wos:
+                                    existing_wos[canon_h_tech] = []
+                                existing_wos[canon_h_tech].append(opt_wo)
+
+                                f_date, f_wos = await self.fetch_board_data_for_date(db_date_key, self.board_req)
+                                if f_date == db_date_key and f_wos:
+                                    for t_key, w_list in existing_wos.items():
+                                        if t_key not in f_wos:
+                                            f_wos[t_key] = w_list
+                                        else:
+                                            old_matching = [w for w in w_list if w.get("canon_customer") == canon_target]
+                                            new_matching = [w for w in f_wos[t_key] if w.get("canon_customer") == canon_target]
+                                            if len(old_matching) > len(new_matching):
+                                                diff = len(old_matching) - len(new_matching)
+                                                f_wos[t_key].extend(old_matching[:diff])
                                     board_date_str, existing_wos = f_date, f_wos
 
                     if skip_vehicle_on_weekends and current_date.weekday() >= 5:
@@ -2649,26 +2859,16 @@ class DispatchBoardDisplayAutomationScraper(BaseScraper):
                             start_time = header.get("start_time")
                             duration = header.get("duration")
                             priority = header.get("priority")
-                            h_tech = header.get("tech_name")
+                            h_tech = (header.get("tech_name") or "").strip()
                             h_task = header.get("task", task)
-                            canon_target = self.canonical_str(name)
-                            matched_sn = next((
-                                s for s in self.template_data.get("service_needed_assets", [])
-                                if s.get("active", True) and (
-                                    self.canonical_str(s.get("name") or s.get("asset_name") or "") == canon_target or
-                                    (re.findall(r'\d+', s.get("name") or s.get("asset_name") or "") and re.findall(r'\d+', name) and
-                                     int(re.findall(r'\d+', s.get("name") or s.get("asset_name") or "")[0]) == int(re.findall(r'\d+', name)[0]) and
-                                     ("🚛" in (s.get("name") or s.get("asset_name") or "")) == ("🚛" in name) and
-                                     ("🛻" in (s.get("name") or s.get("asset_name") or "")) == ("🛻" in name))
-                                )
-                            ), None)
-                            if matched_sn:
-                                priority = matched_sn.get("priority") or "[7] 7.12 SERVICE NEEDED"
-                                summary_note = matched_sn.get("service_note") or header.get("service_note")
-                            else:
-                                summary_note = header.get("service_note")
+
+                            # Guard: skip if unassigned or no valid technician
+                            if not h_tech or h_tech.lower() in ("unassigned", "none", "clear") or not header.get("active", True):
+                                print(f"⏭️ Skipping unassigned truck '{name}' (no technician assigned) from creation.")
+                                continue
 
                             if not dry_run:
+                                canon_target = self.canonical_str(name)
                                 try:
                                     t_dt = datetime.strptime(start_time.strip().upper(), "%I:%M %p")
                                     time_key = t_dt.strftime("%I:%M %p")
@@ -2698,25 +2898,15 @@ class DispatchBoardDisplayAutomationScraper(BaseScraper):
                                     for s in self.template_data.get("out_of_service_assets", [])
                                     if s.get("active", True)
                                 )
-                                truck_on_s4_oos = False
                                 if is_oos_asset:
-                                    truck_on_s4_oos = True
-                                else:
-                                    for wo in existing_wos.get("s4", []):
-                                        if not wo.get("is_appointment") and self.check_item_match(wo, canon_target, require_customer_match=True, match_any_status=True):
-                                            if wo.get("is_out_of_service"):
-                                                truck_on_s4_oos = True
-                                                break
-                                if truck_on_s4_oos:
-                                    print(f"⏭️ Truck '{name}' is on 's4' as Out of Service for {date_str}. Skipping creating truck assign header on tech '{h_tech}'.")
-                                    self.record_wo_created(created_history, db_date_key, canon_h_tech, canon_target, target_count_idx, status="existing_on_board", details={"name": name, "tech": h_tech, "time": time_key})
+                                    print(f"⏭️ Truck '{name}' is Out of Service for {date_str}. Skipping creating truck assign header on tech '{h_tech}'.")
                                     continue
 
                                 truck_on_board = False
                                 found_tech_name = None
                                 found_cust_name = None
                                 for c_t, w_list in existing_wos.items():
-                                    if c_t in ("s4", "s3", "f2", "p2", "") or c_t.startswith("s4") or c_t.startswith("s3"):
+                                    if not c_t or c_t in DUMMY_HEADER_TECHS or any(c_t.startswith(dt) for dt in DUMMY_HEADER_TECHS):
                                         continue
                                     for wo in w_list:
                                         if not wo.get("is_appointment"):
@@ -2734,7 +2924,12 @@ class DispatchBoardDisplayAutomationScraper(BaseScraper):
                                     self.record_wo_created(created_history, db_date_key, canon_h_tech, canon_target, target_count_idx, status="existing_on_board", details={"name": name, "tech": h_tech, "time": time_key})
                                     continue
 
-                                if canon_h_tech and canon_h_tech not in ("s4", "s3", "f2", "p2", "") and not canon_h_tech.startswith("s4") and canon_h_tech in existing_wos:
+                                is_dummy_h_tech = (
+                                    not canon_h_tech or
+                                    canon_h_tech in DUMMY_HEADER_TECHS or
+                                    any(canon_h_tech.startswith(dt) for dt in DUMMY_HEADER_TECHS)
+                                )
+                                if not is_dummy_h_tech and canon_h_tech in existing_wos:
                                     tech_already_has_truck = False
                                     for wo in existing_wos[canon_h_tech]:
                                         if wo.get("is_appointment"):
@@ -2745,7 +2940,6 @@ class DispatchBoardDisplayAutomationScraper(BaseScraper):
                                             break
                                     if tech_already_has_truck:
                                         print(f"⚠️ Tech '{h_tech}' already has a truck assigned on {date_str}. Skipping creating '{name}' to prevent multiple trucks on one technician.")
-                                        self.record_wo_created(created_history, db_date_key, canon_h_tech, canon_target, target_count_idx, status="existing_on_board", details={"name": name, "tech": h_tech, "time": time_key})
                                         continue
 
                                 board_count = 0
@@ -2761,10 +2955,11 @@ class DispatchBoardDisplayAutomationScraper(BaseScraper):
                                              if not wo.get("is_appointment"):
                                                  c_cust = wo.get("canon_customer", "")
                                                  w_time = wo.get("time_key", "")
-                                                 name_match = c_cust == canon_target
+                                                 wo_time_keys = wo.get("time_keys") or ({self.normalize_time_key(w_time)} if w_time else set())
+                                                 name_match = c_cust == canon_target or canon_target in wo.get("canon_strings", [])
                                                  norm_target = self.normalize_time_key(time_key)
                                                  norm_wo = self.normalize_time_key(w_time)
-                                                 time_match = not norm_target or not norm_wo or norm_target == norm_wo
+                                                 time_match = not norm_target or not norm_wo or norm_target == norm_wo or (norm_target in wo_time_keys)
                                                  if name_match and time_match:
                                                      board_count += 1
                                              else:
@@ -2800,12 +2995,34 @@ class DispatchBoardDisplayAutomationScraper(BaseScraper):
                                     duration=duration,
                                     tech_name=h_tech,
                                     immediate_action=immediate_action,
-                                    summary_note=summary_note
+                                    summary_note=header.get("service_note")
                                 )
                                 if res:
                                     self.record_wo_created(created_history, db_date_key, canon_h_tech, canon_target, target_count_idx, status="created", details={"name": name, "tech": h_tech, "time": time_key})
-                                    f_date, f_wos = await self.fetch_board_data_for_date(db_date_key, board_req)
-                                    if f_date == db_date_key:
+                                    opt_wo = {
+                                        "canon_customer": canon_target,
+                                        "canon_strings": [canon_target],
+                                        "canon_combined": canon_target,
+                                        "time_key": time_key,
+                                        "is_service_needed": False,
+                                        "is_out_of_service": False,
+                                        "is_appointment": False
+                                    }
+                                    if canon_h_tech not in existing_wos:
+                                        existing_wos[canon_h_tech] = []
+                                    existing_wos[canon_h_tech].append(opt_wo)
+
+                                    f_date, f_wos = await self.fetch_board_data_for_date(db_date_key, self.board_req)
+                                    if f_date == db_date_key and f_wos:
+                                        for t_key, w_list in existing_wos.items():
+                                            if t_key not in f_wos:
+                                                f_wos[t_key] = w_list
+                                            else:
+                                                old_matching = [w for w in w_list if w.get("canon_customer") == canon_target]
+                                                new_matching = [w for w in f_wos[t_key] if w.get("canon_customer") == canon_target]
+                                                if len(old_matching) > len(new_matching):
+                                                    diff = len(old_matching) - len(new_matching)
+                                                    f_wos[t_key].extend(old_matching[:diff])
                                         board_date_str, existing_wos = f_date, f_wos
 
                     for job in tech_jobs:
@@ -2867,10 +3084,11 @@ class DispatchBoardDisplayAutomationScraper(BaseScraper):
                                          if not wo.get("is_appointment"):
                                              c_cust = wo.get("canon_customer", "")
                                              w_time = wo.get("time_key", "")
-                                             name_match = c_cust == canon_target
+                                             wo_time_keys = wo.get("time_keys") or ({self.normalize_time_key(w_time)} if w_time else set())
+                                             name_match = c_cust == canon_target or canon_target in wo.get("canon_strings", [])
                                              norm_target = self.normalize_time_key(time_key)
                                              norm_wo = self.normalize_time_key(w_time)
-                                             time_match = not norm_target or not norm_wo or norm_target == norm_wo
+                                             time_match = not norm_target or not norm_wo or norm_target == norm_wo or (norm_target in wo_time_keys)
                                              if name_match and time_match:
                                                  board_count += 1
                                          else:
@@ -2911,8 +3129,30 @@ class DispatchBoardDisplayAutomationScraper(BaseScraper):
                             )
                             if res:
                                 self.record_wo_created(created_history, db_date_key, canon_t_tech, canon_target, target_count_idx, status="created", details={"name": name, "tech": t_tech, "time": time_key})
-                                f_date, f_wos = await self.fetch_board_data_for_date(db_date_key, board_req)
-                                if f_date == db_date_key:
+                                opt_wo = {
+                                    "canon_customer": canon_target,
+                                    "canon_strings": [canon_target],
+                                    "canon_combined": canon_target,
+                                    "time_key": time_key,
+                                    "is_service_needed": False,
+                                    "is_out_of_service": False,
+                                    "is_appointment": False
+                                }
+                                if canon_t_tech not in existing_wos:
+                                    existing_wos[canon_t_tech] = []
+                                existing_wos[canon_t_tech].append(opt_wo)
+
+                                f_date, f_wos = await self.fetch_board_data_for_date(db_date_key, self.board_req)
+                                if f_date == db_date_key and f_wos:
+                                    for t_key, w_list in existing_wos.items():
+                                        if t_key not in f_wos:
+                                            f_wos[t_key] = w_list
+                                        else:
+                                            old_matching = [w for w in w_list if w.get("canon_customer") == canon_target]
+                                            new_matching = [w for w in f_wos[t_key] if w.get("canon_customer") == canon_target]
+                                            if len(old_matching) > len(new_matching):
+                                                diff = len(old_matching) - len(new_matching)
+                                                f_wos[t_key].extend(old_matching[:diff])
                                     board_date_str, existing_wos = f_date, f_wos
 
                     for tech in active_techs:
@@ -3002,8 +3242,30 @@ class DispatchBoardDisplayAutomationScraper(BaseScraper):
                             )
                             if res:
                                 self.record_wo_created(created_history, db_date_key, canon_t_assignment, canon_target, target_count_idx, status="created", details={"name": t_name, "tech": t_assignment_name, "time": time_key})
-                                f_date, f_wos = await self.fetch_board_data_for_date(db_date_key, board_req)
-                                if f_date == db_date_key:
+                                opt_wo = {
+                                    "canon_customer": canon_target,
+                                    "canon_strings": [canon_target],
+                                    "canon_combined": canon_target,
+                                    "time_key": time_key,
+                                    "is_service_needed": False,
+                                    "is_out_of_service": False,
+                                    "is_appointment": False
+                                }
+                                if canon_t_assignment not in existing_wos:
+                                    existing_wos[canon_t_assignment] = []
+                                existing_wos[canon_t_assignment].append(opt_wo)
+
+                                f_date, f_wos = await self.fetch_board_data_for_date(db_date_key, self.board_req)
+                                if f_date == db_date_key and f_wos:
+                                    for t_key, w_list in existing_wos.items():
+                                        if t_key not in f_wos:
+                                            f_wos[t_key] = w_list
+                                        else:
+                                            old_matching = [w for w in w_list if w.get("canon_customer") == canon_target]
+                                            new_matching = [w for w in f_wos[t_key] if w.get("canon_customer") == canon_target]
+                                            if len(old_matching) > len(new_matching):
+                                                diff = len(old_matching) - len(new_matching)
+                                                f_wos[t_key].extend(old_matching[:diff])
                                     board_date_str, existing_wos = f_date, f_wos
 
                 if not dry_run:
@@ -3022,7 +3284,13 @@ class DispatchBoardDisplayAutomationScraper(BaseScraper):
                                 pass
                         try:
                             if not hasattr(self, 'asset_scraper') or self.asset_scraper is None:
-                                from asset_assignment_scraper import AssetAssignmentScraper
+                                try:
+                                    from asset_assignment_scraper import AssetAssignmentScraper
+                                except ImportError:
+                                    try:
+                                        from automation.scrapers.asset_assignment_scraper import AssetAssignmentScraper  # type: ignore
+                                    except ImportError:
+                                        from dispatch.asset_assignment_scraper import AssetAssignmentScraper  # type: ignore
                                 self.asset_scraper = AssetAssignmentScraper(template_path=self.template_path)
 
                             self.asset_scraper.playwright = self.playwright

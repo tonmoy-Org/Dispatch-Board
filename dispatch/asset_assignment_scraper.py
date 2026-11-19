@@ -19,7 +19,13 @@ _dispatch_dir = os.path.dirname(os.path.abspath(__file__))
 if _dispatch_dir not in sys.path:
     sys.path.insert(0, _dispatch_dir)
 
-from base_scraper import BaseScraper
+try:
+    from base_scraper import BaseScraper
+except ImportError:
+    try:
+        from automation.scrapers.base_scraper import BaseScraper  # type: ignore
+    except ImportError:
+        from dispatch.base_scraper import BaseScraper  # type: ignore
 
 class AssetAssignmentScraper(BaseScraper):
 
@@ -1583,7 +1589,7 @@ class AssetAssignmentScraper(BaseScraper):
             await self.close_sidepanel()
             return False
 
-    def find_asset_row(self, asset_name: str, rows: List[Dict[str, Any]], target_priority: Optional[str] = None, target_tech: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    def find_asset_row(self, asset_name: str, rows: List[Dict[str, Any]], target_priority: Optional[str] = None, target_tech: Optional[str] = None, target_time: Optional[str] = None) -> Optional[Dict[str, Any]]:
         if not asset_name or not rows:
             return None
         import re
@@ -1650,14 +1656,41 @@ class AssetAssignmentScraper(BaseScraper):
         if not matched_rows:
             return None
 
-        if target_tech:
+        # 1. Best match: target_tech + target_priority + target_time (already fully set!)
+        if target_tech and target_priority and target_time:
             for r in matched_rows:
-                if self.canonical_str(r.get("tech_name", "")) == self.canonical_str(target_tech) or self.is_tech_match(r.get("tech_name", ""), target_tech):
+                tech_match = self.canonical_str(r.get("tech_name", "")) == self.canonical_str(target_tech) or self.is_tech_match(r.get("tech_name", ""), target_tech)
+                prio_match = self.is_priority_match(r.get("priority_name", ""), target_priority)
+                time_match = self.is_time_matching(target_time, r.get("scheduled_date", ""))
+                if tech_match and prio_match and time_match:
                     return r
 
+        # 2. Next best: target_tech + target_priority
+        if target_tech and target_priority:
+            for r in matched_rows:
+                tech_match = self.canonical_str(r.get("tech_name", "")) == self.canonical_str(target_tech) or self.is_tech_match(r.get("tech_name", ""), target_tech)
+                prio_match = self.is_priority_match(r.get("priority_name", ""), target_priority)
+                if tech_match and prio_match:
+                    return r
+
+        # 3. Next: target_tech + target_time
+        if target_tech and target_time:
+            for r in matched_rows:
+                tech_match = self.canonical_str(r.get("tech_name", "")) == self.canonical_str(target_tech) or self.is_tech_match(r.get("tech_name", ""), target_tech)
+                time_match = self.is_time_matching(target_time, r.get("scheduled_date", ""))
+                if tech_match and time_match:
+                    return r
+
+        # 4. Next: target_priority
         if target_priority:
             for r in matched_rows:
                 if self.is_priority_match(r.get("priority_name", ""), target_priority):
+                    return r
+
+        # 5. Next: target_tech
+        if target_tech:
+            for r in matched_rows:
+                if self.canonical_str(r.get("tech_name", "")) == self.canonical_str(target_tech) or self.is_tech_match(r.get("tech_name", ""), target_tech):
                     return r
 
         if target_tech:
@@ -2653,8 +2686,8 @@ class AssetAssignmentScraper(BaseScraper):
 
                 if not saved_assignment:
                     try:
-                        pw_save = self.page.locator('.edit-mode-style_ABe0v button.confirm_I8LeR, [data-edb-sidepanel-card*="Assignment"] button.confirm_I8LeR, button.confirm_I8LeR').first
-                        if await pw_save.count() > 0:
+                        pw_save = self.page.locator('.edit-mode-style_ABe0v button.confirm_I8LeR, [data-edb-sidepanel-card*="Assignment"] button.confirm_I8LeR, [data-edb-sidepanel-card*="Assignment"] button:has-text("Save"), button.confirm_I8LeR, button:has-text("Save")').first
+                        if await pw_save.count() > 0 and await pw_save.is_visible():
                             await pw_save.click(force=True)
                             saved_assignment = True
                     except Exception:
@@ -2950,7 +2983,7 @@ class AssetAssignmentScraper(BaseScraper):
                     service_note = oos_cfg.get("service_note") or oos_cfg.get("reason", "Vehicle is Out of Service for repairs.")
                     target_tech = oos_cfg.get("tech_name", "s4")
 
-                    matching_row = self.find_asset_row(asset_name, all_rows, target_priority=target_priority, target_tech=target_tech)
+                    matching_row = self.find_asset_row(asset_name, all_rows, target_priority=target_priority, target_tech=target_tech, target_time=target_time)
                     if matching_row:
                         wo_num = matching_row.get("work_order_number", "")
                         curr_tech = matching_row.get("tech_name", "")
@@ -3060,9 +3093,9 @@ class AssetAssignmentScraper(BaseScraper):
                                 "7.12" in (r.get("priority_name") or "")) and
                             not self.is_tech_match(r.get("tech_name", ""), assigned_tech_name)
                         ]
-                        matching_row = self.find_asset_row(asset_name, s4_rows, target_priority=target_priority, target_tech=target_tech)
+                        matching_row = self.find_asset_row(asset_name, s4_rows, target_priority=target_priority, target_tech=target_tech, target_time=target_time)
                     else:
-                        matching_row = self.find_asset_row(asset_name, all_rows, target_priority=target_priority, target_tech=target_tech)
+                        matching_row = self.find_asset_row(asset_name, all_rows, target_priority=target_priority, target_tech=target_tech, target_time=target_time)
                     if matching_row:
                         wo_num = matching_row.get("work_order_number", "")
                         curr_tech = matching_row.get("tech_name", "")
@@ -3077,6 +3110,28 @@ class AssetAssignmentScraper(BaseScraper):
 
                         if is_tech_set and is_time_set and is_prio_set:
                             print(f"  ⏭️ WO #{wo_num} for Service Needed '{asset_name}' is ALREADY fully set (Tech: '{curr_tech}', Time: '{curr_sched}', Priority: '{curr_prio}'). Skipping sidepanel.")
+                            # Check if there are duplicate / redundant WOs on s4 for this asset (e.g. leftover morning static WOs)
+                            extra_s4_rows = [
+                                r for r in all_rows
+                                if r.get("tech_name", "").strip().lower() in ("s4", "s3", "")
+                                and str(r.get("work_order_number", "")) != str(wo_num)
+                                and (
+                                    self.canonical_str(r.get("customer_name", "")) == self.canonical_str(asset_name) or
+                                    (re.findall(r'\d+', r.get("customer_name", "")) and re.findall(r'\d+', asset_name) and
+                                     int(re.findall(r'\d+', r.get("customer_name", ""))[0]) == int(re.findall(r'\d+', asset_name)[0]))
+                                )
+                            ]
+                            for dup_row in extra_s4_rows:
+                                dup_wo = dup_row.get("work_order_number")
+                                dup_sched = dup_row.get("scheduled_date", "")
+                                if dup_wo and click_wos:
+                                    print(f"  🗑️ Found duplicate/redundant WO #{dup_wo} for Service Needed asset '{asset_name}' on s4 (Sched: '{dup_sched}'). Cancelling...")
+                                    c_ok = await self.cancel_work_order_via_list(
+                                        wo_number=str(dup_wo),
+                                        reason=f"Duplicate visual aid for Service Needed asset '{asset_name}' (WO #{wo_num} already active at 3:30 PM)."
+                                    )
+                                    if c_ok:
+                                        total_reconciled += 1
                             continue
 
                         total_checked += 1
@@ -3156,7 +3211,7 @@ class AssetAssignmentScraper(BaseScraper):
                     target_priority = st_cfg.get("priority") or ""
                     target_tech = st_cfg.get("tech_name") or "s4"
 
-                    matching_row = self.find_asset_row(asset_name, all_rows, target_priority=target_priority, target_tech=target_tech)
+                    matching_row = self.find_asset_row(asset_name, all_rows, target_priority=target_priority, target_tech=target_tech, target_time=target_time)
                     if matching_row:
                         wo_num = matching_row.get("work_order_number", "")
                         curr_tech = matching_row.get("tech_name", "")
