@@ -1,0 +1,206 @@
+[
+    {
+        "name": "[1] 2-MAN (P)",
+        "color": "rgb(46, 49, 146)"
+    },
+    {
+        "name": "[1] ASSIST (P)",
+        "color": "rgb(216, 228, 188)"
+    },
+    {
+        "name": "[1] P4R (P)",
+        "color": "rgb(17, 108, 19)"
+    },
+    {
+        "name": "[1] PFHS (P)",
+        "color": "rgb(41, 168, 216)"
+    },
+    {
+        "name": "[1] ROUTINE (P)",
+        "color": "rgb(180, 254, 115)"
+    },
+    {
+        "name": "[2] 2-MAN (P)",
+        "color": "rgb(217, 122, 30)"
+    },
+    {
+        "name": "[2] ASSIST (S)",
+        "color": "rgb(191, 90, 224)"
+    },
+    {
+        "name": "[2] CORRECTIONS & UPGRADE (S)",
+        "color": "rgb(245, 230, 99)"
+    },
+    {
+        "name": "[2] EXCAVATOR (S)",
+        "color": "rgb(128, 96, 77)"
+    },
+    {
+        "name": "[2] ROUTINE (S)",
+        "color": "rgb(231, 163, 211)"
+    },
+    {
+        "name": "[2] TROUBLESHOOT (S)",
+        "color": "rgb(255, 20, 147)"
+    },
+    {
+        "name": "[3] ---- 𝐃𝐎𝐍'𝐓 𝐏𝐀𝐒𝐒 ---------------------------",
+        "color": "rgb(12, 12, 12)"
+    },
+    {
+        "name": "[4] DO NOT DISPATCH (Tracking)",
+        "color": "rgb(193, 18, 31)"
+    },
+    {
+        "name": "[4] SHOP / OPS (Tracking)",
+        "color": "rgb(197, 197, 197)"
+    },
+    {
+        "name": "[5] EXC (Asset Assignment)",
+        "color": "rgb(255, 216, 189)"
+    },
+    {
+        "name": "[5] LABORER (Asset Assignment)",
+        "color": "rgb(255, 246, 199)"
+    },
+    {
+        "name": "[5] PT (Asset Assignment)",
+        "color": "rgb(196, 228, 216)"
+    },
+    {
+        "name": "[5] SER TR (Asset Assignment)",
+        "color": "rgb(216, 201, 219)"
+    },
+    {
+        "name": "[5] TRAI (Asset Assignment)",
+        "color": "rgb(216, 204, 198)"
+    },
+    {
+        "name": "[6] LABORER (Class)",
+        "color": "rgb(184, 134, 8)"
+    },
+    {
+        "name": "[6] PUMPER (Class)",
+        "color": "rgb(0, 140, 90)"
+    },
+    {
+        "name": "[6] SVC TECH (Class)",
+        "color": "rgb(194, 24, 91)"
+    },
+    {
+        "name": "[7] 2-MAN (P) (STATUS)",
+        "color": "rgb(184, 194, 255)"
+    },
+    {
+        "name": "[7] 2-MAN (S) (STATUS)",
+        "color": "rgb(247, 200, 165)"
+    },
+    {
+        "name": "[7] 7.1",
+        "color": "rgb(92, 142, 135)"
+    },
+    {
+        "name": "[7] 7.11 Teams",
+        "color": "rgb(126, 106, 168)"
+    },
+    {
+        "name": "[7] 7.12 SERVICE NEEDED",
+        "color": "rgb(242, 107, 91)"
+    },
+    {
+        "name": "[7] 7.2",
+        "color": "rgb(58, 109, 102)"
+    },
+    {
+        "name": "[7] 7.3 TACOMA DUMP",
+        "color": "rgb(31, 81, 75)"
+    },
+    {
+        "name": "[7] 7.4",
+        "color": "rgb(6, 63, 54)"
+    },
+    {
+        "name": "[7] 7.5",
+        "color": "rgb(15, 54, 50)"
+    },
+    {
+        "name": "[7] 7.6 PUMP H/T",
+        "color": "rgb(6, 34, 31)"
+    },
+    {
+        "name": "[7] 7.7",
+        "color": "rgb(59, 59, 59)"
+    },
+    {
+        "name": "[7] 7.8 ATTENDANCE",
+        "color": "rgb(245, 245, 241)"
+    },
+    {
+        "name": "[7] 7.9",
+        "color": "rgb(218, 215, 208)"
+    },
+    {
+        "name": "[7] ASSIST (P) (STATUS)",
+        "color": "rgb(242, 249, 222)"
+    },
+    {
+        "name": "[7] ASSIST (S) (STATUS)",
+        "color": "rgb(233, 201, 247)"
+    },
+    {
+        "name": "[7] BLANK SPACE",
+        "color": "rgb(248, 245, 244)"
+    },
+    {
+        "name": "[7] BOARDER",
+        "color": "rgb(122, 122, 122)"
+    },
+    {
+        "name": "[7] CORRECTIONS & UPGRADES (STATUS)",
+        "color": "rgb(255, 241, 168)"
+    },
+    {
+        "name": "[7] DO NOT DISPATCH (STATUS)",
+        "color": "rgb(247, 182, 191)"
+    },
+    {
+        "name": "[7] EXCAVATOR (STATUS)",
+        "color": "rgb(217, 197, 183)"
+    },
+    {
+        "name": "[7] P4R (STATUS)",
+        "color": "rgb(200, 239, 207)"
+    },
+    {
+        "name": "[7] PFHS (STATUS)",
+        "color": "rgb(199, 238, 250)"
+    },
+    {
+        "name": "[7] ROUTINE (P) (STATUS)",
+        "color": "rgb(228, 249, 190)"
+    },
+    {
+        "name": "[7] ROUTINE (S) (STATUS)",
+        "color": "rgb(248, 216, 236)"
+    },
+    {
+        "name": "[7] SHOP / OPS (STATUS)",
+        "color": "rgb(236, 236, 236)"
+    },
+    {
+        "name": "[7] TROUBLESHOOT (STATUS)",
+        "color": "rgb(255, 192, 224)"
+    },
+    {
+        "name": "[8] EXCUSED",
+        "color": "rgb(178, 244, 150)"
+    },
+    {
+        "name": "[8] PENDING",
+        "color": "rgb(220, 172, 90)"
+    },
+    {
+        "name": "[8] UNEXCUSED",
+        "color": "rgb(235, 78, 78)"
+    }
+]

@@ -14,6 +14,9 @@ __pycache__/
 dispatch/config/status_state.json
 dispatch/scraped_asset_assignments.json
 dispatch/config/scraped_asset_assignments.json
+dispatch/job_checkin_state.json
+job_checkin_state.json
+*job_checkin_state.json
 
 # IDE & OS files
 .vscode/

@@ -3388,7 +3388,16 @@ if __name__ == "__main__":
     parser.add_argument("--live", action="store_true", help="Run live on FieldEdge (skips dry-run)")
     parser.add_argument("--start-date", type=str, help="Starting date (e.g. 'August 15', '08/15/2026'). Defaults to today.")
     parser.add_argument("--skip-asset", action="store_true", help="Skip running the asset assignment tool for each date")
+    parser.add_argument("--ignore-working-hours", action="store_true", help="Bypass daytime sleep mode (7 AM - 8 PM PST)")
     args = parser.parse_args()
+
+    from base_scraper import get_pst_now
+    now = get_pst_now()
+    if 7 <= now.hour < 20 and not args.ignore_working_hours:
+        print(f"⏸️ Notice: Current time ({now.strftime('%I:%M:%S %p PST')}) is within daytime working hours (7:00 AM - 8:00 PM PST).")
+        print("   Dispatch Board Display Automation is paused during daytime to avoid disrupting live dispatchers.")
+        print("   It is scheduled to run overnight starting at 8:00 PM PST. To execute anyway, pass --ignore-working-hours.")
+        sys.exit(0)
 
     scraper = DispatchBoardDisplayAutomationScraper()
     asyncio.run(scraper.run(days=args.days, dry_run=not args.live, start_date_str=args.start_date, skip_asset=args.skip_asset))

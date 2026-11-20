@@ -25,4 +25,29 @@ services:
       - ./dispatch/dispatch_board_display_automation_scraper.py:/app/dispatch_board_display_automation_scraper.py
       - ./dispatch/asset_assignment_scraper.py:/app/asset_assignment_scraper.py
       - ./dispatch/base_scraper.py:/app/base_scraper.py
+      - ./dispatch/job_checkin_automation.py:/app/job_checkin_automation.py
+      - ./dispatch/job_checkin_state.json:/app/job_checkin_state.json
     command: python run_standalone.py --live --days 31 --loop --port 3000
+
+  job-checkin-automation:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: job_checkin_automation
+    restart: always
+    init: true
+    shm_size: '2gb'
+    env_file:
+      - dispatch/.env
+    environment:
+      - HEADLESS=true
+      - DISPLAY=:99
+      - TZ=America/Los_Angeles
+    volumes:
+      - ./dispatch/config:/app/config
+      - ./dispatch/job_checkin_automation.py:/app/job_checkin_automation.py
+      - ./dispatch/job_checkin_state.json:/app/job_checkin_state.json
+    command: python job_checkin_automation.py --daemon --poll-interval 60
+    profiles:
+      - checkin
+      - all

@@ -10,7 +10,7 @@ import asyncio
 import argparse
 import json
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 from contextlib import asynccontextmanager
 
 import uvicorn
@@ -187,6 +187,22 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                             <span id="serviceSessionStatus" class="text-xs font-medium text-[#24B47E]">Connected</span>
                         </div>
                         <div class="flex items-center gap-[2px] h-8 w-full" id="barsSession">
+                            <!-- 90 bars generated via JS -->
+                        </div>
+                        <div class="flex justify-between items-center text-[11px] text-gray-400 mt-2 font-normal">
+                            <span>90 days ago</span>
+                            <span class="text-gray-500 font-medium">100 % uptime</span>
+                            <span>Today</span>
+                        </div>
+                    </div>
+
+                    <!-- Service 4: Job Check-in & Quo SMS -->
+                    <div class="p-4 sm:p-5">
+                        <div class="flex justify-between items-center mb-3">
+                            <span class="text-sm font-medium text-gray-800">FieldEdge & Quo Job Check-in SMS Automation</span>
+                            <span id="serviceCheckinStatus" class="text-xs font-medium text-[#24B47E]">Operational</span>
+                        </div>
+                        <div class="flex items-center gap-[2px] h-8 w-full" id="barsCheckin">
                             <!-- 90 bars generated via JS -->
                         </div>
                         <div class="flex justify-between items-center text-[11px] text-gray-400 mt-2 font-normal">
@@ -459,6 +475,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             renderUptimeBars('barsSite');
             renderUptimeBars('barsAsset');
             renderUptimeBars('barsSession');
+            renderUptimeBars('barsCheckin');
             renderIncidentHistory('initialized', '');
             fetchStatus();
             setInterval(fetchStatus, 3000);
@@ -481,6 +498,33 @@ def on_progress_update(progress_dict):
     STATUS_DATA["last_run_pst"] = get_pst_now().strftime("%Y-%m-%d %I:%M:%S %p PST")
 
 
+def is_within_daytime_sleep_window(now_dt: Optional[datetime] = None) -> Tuple[bool, str, int]:
+    """
+    Checks if current PST time falls within daytime working hours (7:00 AM - 8:00 PM PST)
+    during which Dispatch Board Display Automation must sleep to avoid interfering with live dispatchers.
+    Returns (is_sleep_time, window_desc, seconds_remaining_until_wake).
+    """
+    now = now_dt or get_pst_now()
+    try:
+        start_hour = int(os.getenv("DISPATCH_SLEEP_START_HOUR_PST", "7"))
+        end_hour = int(os.getenv("DISPATCH_SLEEP_END_HOUR_PST", "20"))
+    except ValueError:
+        start_hour, end_hour = 7, 20
+
+    start_time = now.replace(hour=start_hour, minute=0, second=0, microsecond=0)
+    end_time = now.replace(hour=end_hour, minute=0, second=0, microsecond=0)
+
+    is_sleep_time = (start_time <= now <= end_time)
+    window_desc = f"{start_hour:02d}:00 AM - {end_hour % 12 or 12}:00 PM PST"
+
+    if is_sleep_time:
+        remaining_sec = max(60, int((end_time - now).total_seconds()))
+    else:
+        remaining_sec = 0
+
+    return is_sleep_time, window_desc, remaining_sec
+
+
 class DefaultArgs:
     days = 31
     live = True
@@ -490,6 +534,7 @@ class DefaultArgs:
     port = int(os.getenv("PORT", "3000"))
     skip_asset = False
     force = False
+    ignore_working_hours = False
 
 
 async def run_automation(args):
@@ -504,6 +549,38 @@ async def run_automation(args):
     if args.loop:
         print(f"🔄 Loop Mode enabled. Running every {args.interval_hours} hours to maintain {args.days} pre-created days...")
         while True:
+            # Daytime sleep check (7:00 AM - 8:00 PM PST)
+            should_sleep, win_desc, rem_seconds = is_within_daytime_sleep_window()
+            if should_sleep and not getattr(args, "ignore_working_hours", False):
+                h_left = rem_seconds // 3600
+                m_left = (rem_seconds % 3600) // 60
+                t_str = f"{h_left}h {m_left}m" if h_left > 0 else f"{m_left}m"
+                sleep_msg = (
+                    f"Sleeping during daytime working hours ({win_desc}) to prevent interference with live dispatchers. "
+                    f"Resumes at 8:00 PM PST (~{t_str} remaining)."
+                )
+                print(f"\n⏸️ [{get_pst_now().strftime('%Y-%m-%d %I:%M:%S %p PST')}] {sleep_msg}")
+                STATUS_DATA["last_status"] = "sleeping_working_hours"
+                STATUS_DATA["fieldedge_status"] = "Sleeping (Resumes 8:00 PM PST)"
+                STATUS_DATA["progress"].update({
+                    "status": "sleeping_working_hours",
+                    "status_message": f"⏸️ {sleep_msg}"
+                })
+
+                while True:
+                    still_sleep, _, sec_left = is_within_daytime_sleep_window()
+                    if not still_sleep or getattr(args, "ignore_working_hours", False):
+                        print(f"\n🌅 [{get_pst_now().strftime('%Y-%m-%d %I:%M:%S %p PST')}] Daytime working hours ended! Waking up Dispatch Board Display Automation...")
+                        break
+                    hl = sec_left // 3600
+                    ml = (sec_left % 3600) // 60
+                    ts = f"{hl}h {ml}m" if hl > 0 else f"{ml}m"
+                    STATUS_DATA["progress"]["status_message"] = (
+                        f"⏸️ Sleeping during daytime working hours ({win_desc}) to prevent interference with live dispatchers. "
+                        f"Resumes at 8:00 PM PST (~{ts} remaining)."
+                    )
+                    await asyncio.sleep(min(sec_left, 60))
+
             now_pst = get_pst_now().strftime("%Y-%m-%d %I:%M:%S %p PST")
             print(f"\n⏰ [{now_pst}] Starting automation run for {args.days} days...")
             if current_start_date:
@@ -558,6 +635,21 @@ async def run_automation(args):
             print(f"\n😴 Run complete. Waiting {args.interval_hours} hours until next run. (Press Ctrl+C to stop)")
             await asyncio.sleep(sleep_seconds)
     else:
+        should_sleep, win_desc, rem_seconds = is_within_daytime_sleep_window()
+        if should_sleep and not getattr(args, "ignore_working_hours", False):
+            hl = rem_seconds // 3600
+            ml = (rem_seconds % 3600) // 60
+            ts = f"{hl}h {ml}m" if hl > 0 else f"{ml}m"
+            print(f"⏸️ [{get_pst_now().strftime('%Y-%m-%d %I:%M:%S %p PST')}] Dispatch Board Display Automation is configured to SLEEP during working hours ({win_desc}).")
+            print(f"   Use --ignore-working-hours to bypass sleep and run anyway.")
+            STATUS_DATA["last_status"] = "sleeping_working_hours"
+            STATUS_DATA["fieldedge_status"] = "Sleeping (Resumes 8:00 PM PST)"
+            STATUS_DATA["progress"].update({
+                "status": "sleeping_working_hours",
+                "status_message": f"⏸️ Sleeping during daytime working hours ({win_desc}). Resumes at 8:00 PM PST (~{ts} remaining)."
+            })
+            return
+
         now_pst = get_pst_now().strftime("%Y-%m-%d %I:%M:%S %p PST")
         STATUS_DATA["last_run"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         STATUS_DATA["last_run_pst"] = now_pst
@@ -692,6 +784,20 @@ async def get_health():
     return {"status": "ok", "service": STATUS_DATA["service"], "mode": STATUS_DATA["mode"]}
 
 
+@app.get("/api/checkin/status")
+@app.get("/dispatch/api/checkin/status")
+async def get_checkin_status():
+    """Returns the current state of Job Check-in Automation."""
+    state_file = os.getenv("JOB_CHECKIN_STATE_FILE", os.path.join(_dispatch_dir, "job_checkin_state.json"))
+    if os.path.exists(state_file):
+        try:
+            with open(state_file, "r", encoding="utf-8") as f:
+                return JSONResponse(content=json.load(f))
+        except Exception as e:
+            return JSONResponse(status_code=500, content={"error": str(e)})
+    return JSONResponse(content={"jobs": {}, "last_run": None, "status": "No checkin state recorded yet."})
+
+
 @app.post("/api/trigger")
 @app.post("/dispatch/api/trigger")
 async def trigger_run(background_tasks: BackgroundTasks):
@@ -745,6 +851,7 @@ def main():
     parser.add_argument("--port", type=int, default=int(os.getenv("PORT", "3000")), help="HTTP status server port (default: 3000)")
     parser.add_argument("--skip-asset", action="store_true", help="Skip running the asset assignment tool for each date")
     parser.add_argument("--force", action="store_true", help="Force fresh start: bypass smart skip and verify/re-create all board items")
+    parser.add_argument("--ignore-working-hours", action="store_true", help="Bypass daytime sleep mode and run Display Automation during working hours (7 AM - 8 PM PST)")
     args = parser.parse_args()
 
     app.state.args = args
