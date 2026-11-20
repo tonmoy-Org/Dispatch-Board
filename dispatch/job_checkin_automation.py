@@ -174,7 +174,14 @@ class QuoClient:
                 messages = res.get("data", [])
                 incoming = [m for m in messages if m.get("direction") == "incoming"]
                 if since_iso:
-                    incoming = [m for m in incoming if (m.get("createdAt") or "") > since_iso]
+                    try:
+                        since_dt = datetime.fromisoformat(since_iso.replace("Z", "+00:00"))
+                        incoming = [
+                            m for m in incoming
+                            if m.get("createdAt") and datetime.fromisoformat(m["createdAt"].replace("Z", "+00:00")) > since_dt
+                        ]
+                    except Exception:
+                        incoming = [m for m in incoming if (m.get("createdAt") or "") > since_iso]
                 return incoming
         except Exception as e:
             print(f"⚠️ Error fetching messages for {participant_number}: {e}")
@@ -772,14 +779,15 @@ class JobCheckinAutomation:
                         rule = PRIORITY_CHECKIN_RULES.get(category, PRIORITY_CHECKIN_RULES["30min"])
 
                         is_due = False
-                        if job_entry["checkin_count"] == 0:
-                            if elapsed_mins >= rule["initial_delay_mins"]:
-                                 is_due = True
-                        else:
-                            last_checkin_dt = datetime.fromisoformat(job_entry["last_checkin_at"])
-                            mins_since_last = int((now_pst - last_checkin_dt).total_seconds() / 60)
-                            if mins_since_last >= rule["interval_mins"]:
-                                is_due = True
+                        if not job_entry.get("reported_time"):
+                            if job_entry["checkin_count"] == 0:
+                                if elapsed_mins >= rule["initial_delay_mins"]:
+                                     is_due = True
+                            elif job_entry.get("last_checkin_at"):
+                                last_checkin_dt = datetime.fromisoformat(job_entry["last_checkin_at"])
+                                mins_since_last = int((now_pst - last_checkin_dt).total_seconds() / 60)
+                                if mins_since_last >= rule["interval_mins"]:
+                                    is_due = True
 
                         if is_due:
                             msg = self.build_checkin_message(elapsed_mins)
