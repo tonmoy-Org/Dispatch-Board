@@ -722,10 +722,28 @@ class JobCheckinAutomation:
                     if not tech_phone:
                         continue
 
-                    is_working = (status.lower() == "working" or s.get("AssignmentTechStatus") == 2)
-                    is_completed = (status.lower() in ("completed", "complete") or s.get("Completed", False))
+                    is_completed = (
+                        status.lower() in ("completed", "complete", "closed", "canceled", "cancelled")
+                        or s.get("Completed") is True
+                        or s.get("AssignmentTechStatus") in (3, 4)
+                    )
 
                     job_entry = active_jobs_state.get(sched_id)
+
+                    if is_completed:
+                        if job_entry and job_entry.get("note_created"):
+                            sub_row_key = job_entry.get("note_sub_row") or SUB_ROW_MAPPING.get(tech_key)
+                            note_desc = f"Complete @ {job_entry.get('note_time')}"
+                            print(f"🧹 Job COMPLETED for {tech_name}! Deleting note '{note_desc}' on sub-row '{sub_row_key}'...")
+                            if not self.dry_run:
+                                del_ok = await fe_mgr.delete_note(sub_row_key, note_desc)
+                                if del_ok:
+                                    job_entry["note_created"] = False
+                                    stats["notes_deleted"] += 1
+                        active_jobs_state.pop(sched_id, None)
+                        continue
+
+                    is_working = (status.lower() == "working" or s.get("AssignmentTechStatus") == 2)
 
                     if is_working:
                         stats["working"] += 1
@@ -802,17 +820,7 @@ class JobCheckinAutomation:
                                                 stats["notes_created"] += 1
                                     break
 
-                    elif is_completed:
-                        if job_entry and job_entry.get("note_created"):
-                            sub_row_key = job_entry.get("note_sub_row") or SUB_ROW_MAPPING.get(tech_key)
-                            note_desc = f"Complete @ {job_entry.get('note_time')}"
-                            print(f"🧹 Job COMPLETED for {tech_name}! Deleting note '{note_desc}' on sub-row '{sub_row_key}'...")
-                            if not self.dry_run:
-                                del_ok = await fe_mgr.delete_note(sub_row_key, note_desc)
-                                if del_ok:
-                                    job_entry["note_created"] = False
-                                    stats["notes_deleted"] += 1
-                            active_jobs_state.pop(sched_id, None)
+
 
         self.state["last_run"] = now_pst.isoformat()
         self.save_state()
