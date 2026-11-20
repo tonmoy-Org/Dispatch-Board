@@ -48,6 +48,3 @@ services:
       - ./dispatch/job_checkin_automation.py:/app/job_checkin_automation.py
       - ./dispatch/job_checkin_state.json:/app/job_checkin_state.json
     command: python job_checkin_automation.py --daemon --poll-interval 60
-    profiles:
-      - checkin
-      - all
