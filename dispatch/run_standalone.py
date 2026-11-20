@@ -444,6 +444,22 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 sessionStatus.textContent = data.fieldedge_status.includes('Active') ? 'Operational' : data.fieldedge_status;
             }
 
+            // FieldEdge & Quo Job Check-in indicator
+            const checkinStatus = document.getElementById('serviceCheckinStatus');
+            if (checkinStatus && data.checkin) {
+                const ci = data.checkin;
+                if (ci.status === 'outside_operating_hours') {
+                    checkinStatus.textContent = 'Paused (Resumes 7:00 AM PST)';
+                    checkinStatus.className = 'text-xs font-medium text-amber-600';
+                } else if (ci.active_jobs_count > 0) {
+                    checkinStatus.textContent = `Operational (${ci.active_jobs_count} Active Jobs)`;
+                    checkinStatus.className = 'text-xs font-medium text-[#24B47E]';
+                } else {
+                    checkinStatus.textContent = ci.status_message || 'Operational';
+                    checkinStatus.className = 'text-xs font-medium text-[#24B47E]';
+                }
+            }
+
             renderIncidentHistory(data.last_status, data.last_run_pst);
         }
 
@@ -769,12 +785,30 @@ async def get_dashboard():
 @app.get("/dispatch/api/status")
 async def get_status_json():
     """Returns the current real-time automation status in JSON format."""
+    state_file = os.getenv("JOB_CHECKIN_STATE_FILE", os.path.join(_dispatch_dir, "job_checkin_state.json"))
+    checkin_info = {
+        "status": "operational",
+        "status_message": "Operational",
+        "active_jobs_count": 0,
+        "last_run_pst": None,
+        "stats": {}
+    }
+    if os.path.exists(state_file):
+        try:
+            with open(state_file, "r", encoding="utf-8") as f:
+                c_data = json.load(f)
+                checkin_info.update(c_data)
+        except Exception:
+            pass
+
+    resp_data = dict(STATUS_DATA)
+    resp_data["checkin"] = checkin_info
     headers = {
         "Cache-Control": "no-cache, no-store, must-revalidate",
         "Pragma": "no-cache",
         "Expires": "0"
     }
-    return JSONResponse(content=STATUS_DATA, headers=headers)
+    return JSONResponse(content=resp_data, headers=headers)
 
 
 @app.get("/health")

@@ -696,7 +696,18 @@ class JobCheckinAutomation:
         groups = raw_board.get("Board", {}).get("Groups", [])
 
         active_jobs_state = self.state.setdefault("jobs", {})
-        stats = {"working": 0, "sms_sent": 0, "replies": 0, "notes_created": 0, "notes_deleted": 0}
+        stats = {
+            "total_techs_checked": 0,
+            "total_schedules_checked": 0,
+            "working": 0,
+            "completed": 0,
+            "skipped_internal": 0,
+            "sms_sent": 0,
+            "replies": 0,
+            "notes_created": 0,
+            "notes_deleted": 0
+        }
+        seen_sched_ids = set()
 
         for g in groups:
             for row_idx, r in enumerate(g.get("Rows", [])):
@@ -712,8 +723,15 @@ class JobCheckinAutomation:
                 if not tech_key:
                     continue
 
+                stats["total_techs_checked"] += 1
+
                 for s in r.get("ScheduleItems", []):
                     sched_id = s.get("DispatchID") or s.get("EntityID")
+                    if not sched_id:
+                        continue
+                    seen_sched_ids.add(sched_id)
+                    stats["total_schedules_checked"] += 1
+
                     item_name = (s.get("Name") or "").strip()
                     task_name = (s.get("TaskName") or "").strip()
                     status = (s.get("Status") or s.get("AssignmentTechStatusName") or "").strip()
@@ -723,6 +741,7 @@ class JobCheckinAutomation:
 
                     category = self.classify_priority(task_name, p_name, p_col)
                     if category == "internal":
+                        stats["skipped_internal"] += 1
                         continue
 
                     tech_phone = TECH_PHONE_MAPPING.get(tech_key)
@@ -738,6 +757,7 @@ class JobCheckinAutomation:
                     job_entry = active_jobs_state.get(sched_id)
 
                     if is_completed:
+                        stats["completed"] += 1
                         if job_entry and job_entry.get("note_created"):
                             sub_row_key = job_entry.get("note_sub_row") or SUB_ROW_MAPPING.get(tech_key)
                             note_desc = f"Complete @ {job_entry.get('note_time')}"
@@ -776,6 +796,8 @@ class JobCheckinAutomation:
 
                         started_at = datetime.fromisoformat(job_entry["working_started_at"])
                         elapsed_mins = int((now_pst - started_at).total_seconds() / 60)
+                        job_entry["elapsed_minutes"] = elapsed_mins
+                        job_entry["last_updated_at"] = now_pst.isoformat()
                         rule = PRIORITY_CHECKIN_RULES.get(category, PRIORITY_CHECKIN_RULES["30min"])
 
                         is_due = False
@@ -830,11 +852,29 @@ class JobCheckinAutomation:
 
 
 
+        # Clean up stale jobs that are no longer on today's board
+        for dead_id in list(active_jobs_state.keys()):
+            if dead_id not in seen_sched_ids:
+                dead_job = active_jobs_state.pop(dead_id)
+                if dead_job.get("note_created"):
+                    sub_row_key = dead_job.get("note_sub_row") or SUB_ROW_MAPPING.get(dead_job.get("tech_key"))
+                    note_desc = f"Complete @ {dead_job.get('note_time')}"
+                    print(f"🧹 Stale job removed from board for {dead_job.get('tech_name')}. Deleting note '{note_desc}'...")
+                    if not self.dry_run:
+                        del_ok = await fe_mgr.delete_note(sub_row_key, note_desc)
+                        if del_ok:
+                            stats["notes_deleted"] += 1
+
+        self.state["status"] = "operational"
+        self.state["status_message"] = f"Operational ({stats['working']} working, {len(active_jobs_state)} active jobs tracked)"
         self.state["last_run"] = now_pst.isoformat()
+        self.state["last_run_pst"] = now_pst.strftime("%Y-%m-%d %I:%M:%S %p PST")
+        self.state["stats"] = stats
+        self.state["active_jobs_count"] = len(active_jobs_state)
         self.save_state()
         await fe_mgr.cleanup()
 
-        print(f"📊 SUMMARY: Working: {stats['working']} | SMS Sent: {stats['sms_sent']} | Replies: {stats['replies']} | Notes Created: {stats['notes_created']} | Notes Deleted: {stats['notes_deleted']}")
+        print(f"📊 SUMMARY: Techs: {stats['total_techs_checked']} | Scheds: {stats['total_schedules_checked']} | Working: {stats['working']} | Completed: {stats['completed']} | Internal: {stats['skipped_internal']} | SMS Sent: {stats['sms_sent']} | Replies: {stats['replies']} | Notes Created: {stats['notes_created']} | Notes Deleted: {stats['notes_deleted']}")
 
 
 def main():
@@ -932,6 +972,9 @@ def main():
             is_active, window_desc = is_within_operating_hours(now_pst)
 
             if not is_active and not args.ignore_hours:
+                automation.state["status"] = "outside_operating_hours"
+                automation.state["status_message"] = f"Paused: outside operating hours ({window_desc}). Monitoring resumes at 7:00 AM PST."
+                automation.save_state()
                 if time.time() - last_logged_outside > 600:
                     print(f"⏸️ [{now_pst.strftime('%I:%M:%S %p PST')}] Outside operating hours ({window_desc}). Monitoring is paused until 7:00 AM PST.")
                     last_logged_outside = time.time()
